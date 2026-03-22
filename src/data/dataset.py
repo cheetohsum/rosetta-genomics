@@ -44,17 +44,11 @@ class GenomicDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Generate a synthetic genomic sequence with realistic properties."""
-        # Generate sequence with approximate genomic statistics
-        seq = self._generate_realistic_sequence()
+        seq, coding_regions = self._generate_realistic_sequence()
 
-        # Tokenize
         input_ids = self.tokenizer.encode(seq)
-
-        # Create MLM training data
         masked_ids, labels = self.tokenizer.mask_tokens(input_ids)
-
-        # Generate frame labels (which frames are coding)
-        frame_labels = self._generate_frame_labels(len(seq))
+        frame_labels = self._generate_frame_labels(len(seq), coding_regions)
 
         return {
             'input_ids': masked_ids,
@@ -63,28 +57,33 @@ class GenomicDataset(Dataset):
             'frame_labels': frame_labels,
         }
 
-    def _generate_realistic_sequence(self) -> str:
+    def _generate_realistic_sequence(self) -> tuple[str, list[tuple[int, int, int]]]:
         """
         Generate a sequence with realistic genomic properties.
 
-        Encodes:
-        - GC content variation (~40-60%)
-        - Coding regions with codon periodicity
-        - Non-coding regions with different statistics
+        Returns:
+            (sequence, coding_regions) where coding_regions is a list of
+            (start, end, frame) tuples tracking where ORFs were placed.
         """
-        nucleotides = ['A', 'C', 'G', 'T']
         seq = []
+        coding_regions = []
 
-        # Decide regions: some coding, some non-coding
         pos = 0
         while pos < self.seq_length:
             if random.random() < self.coding_fraction:
-                # Coding region: start with ATG, end with stop
-                region_len = random.randint(90, 600)  # 30-200 codons
+                # Coding region with optional frame offset
+                frame = random.choices([0, 1, 2], weights=[0.6, 0.2, 0.2])[0]
+                # Add offset nucleotides to shift the reading frame
+                if frame > 0:
+                    offset_nts = random.choices(['A', 'C', 'G', 'T'], k=frame)
+                    seq.extend(offset_nts)
+                    pos += frame
+
+                region_len = random.randint(90, 600)
                 region_len = min(region_len, self.seq_length - pos)
                 region = self._generate_coding_region(region_len)
+                coding_regions.append((pos, pos + len(region), frame))
             else:
-                # Non-coding region
                 region_len = random.randint(100, 500)
                 region_len = min(region_len, self.seq_length - pos)
                 gc_content = random.uniform(0.35, 0.65)
@@ -93,7 +92,7 @@ class GenomicDataset(Dataset):
             seq.extend(region)
             pos += len(region)
 
-        return ''.join(seq[:self.seq_length])
+        return ''.join(seq[:self.seq_length]), coding_regions
 
     def _generate_coding_region(self, length: int) -> list[str]:
         """Generate a coding region with codon structure."""
@@ -122,14 +121,15 @@ class GenomicDataset(Dataset):
         weights = [at_prob, gc_prob, gc_prob, at_prob]  # A, C, G, T
         return random.choices(['A', 'C', 'G', 'T'], weights=weights, k=length)
 
-    def _generate_frame_labels(self, seq_len: int) -> torch.Tensor:
-        """Generate binary labels for which frames are coding at each position."""
+    def _generate_frame_labels(
+        self, seq_len: int, coding_regions: list[tuple[int, int, int]]
+    ) -> torch.Tensor:
+        """Generate binary labels based on actual coding region positions."""
         labels = torch.zeros(seq_len, 6)
-        # Randomly assign some positions as coding in frame 0 (forward)
-        # In real data, this comes from gene annotations
-        coding_start = random.randint(0, seq_len // 4)
-        coding_end = min(coding_start + random.randint(90, 600), seq_len)
-        labels[coding_start:coding_end, 0] = 1.0  # Frame 0 forward
+        for start, end, frame in coding_regions:
+            end = min(end, seq_len)
+            if start < seq_len:
+                labels[start:end, frame] = 1.0
         return labels
 
 

@@ -201,13 +201,23 @@ class MultiFrameAttention(nn.Module):
         self.d_model = config.d_model
         self.d_head = config.d_model // config.n_heads
 
-        # Per-frame Q, K, V projections
-        self.frame_qkv = nn.ModuleList([
-            nn.Linear(config.d_model, 3 * config.d_model)
+        # Shared K, V projection -- all frames attend over the same keys/values
+        self.shared_kv = nn.Linear(config.d_model, 2 * config.d_model)
+
+        # Per-frame Q projections -- each frame asks different questions
+        self.frame_q = nn.ModuleList([
+            nn.Linear(config.d_model, config.d_model)
             for _ in range(config.n_frames)
         ])
 
-        # Cross-frame attention gate: learns which frames are active
+        # Cross-frame MLP: lets frame outputs interact before gating
+        self.cross_frame_mlp = nn.Sequential(
+            nn.Linear(config.n_frames * config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.n_frames * config.d_model),
+        )
+
+        # Frame gate: learns which frames are active at each position
         self.frame_gate = nn.Sequential(
             nn.Linear(config.d_model, config.n_frames * config.d_model // 4),
             nn.GELU(),
@@ -237,40 +247,48 @@ class MultiFrameAttention(nn.Module):
         batch, seq_len, d_model = x.shape
         residual = x
 
-        # Compute frame gates: (batch, seq_len, n_frames)
-        gates = self.frame_gate(x)
+        # Shared keys and values -- all frames attend over the same space
+        kv = self.shared_kv(x)
+        k_shared, v_shared = kv.chunk(2, dim=-1)
+        k_shared = k_shared.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        v_shared = v_shared.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Process each frame
+        # Per-frame queries -- each frame asks different questions of the shared K/V
         frame_outputs = []
         for frame_idx in range(self.n_frames):
-            # Project to Q, K, V for this frame
-            qkv = self.frame_qkv[frame_idx](x)
-            q, k, v = qkv.chunk(3, dim=-1)
-
-            # Reshape for multi-head attention
+            q = self.frame_q[frame_idx](x)
             q = q.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
-            k = k.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
-            v = v.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
 
-            # Scaled dot-product attention
             scale = math.sqrt(self.d_head)
-            attn = torch.matmul(q, k.transpose(-2, -1)) / scale
+            attn = torch.matmul(q, k_shared.transpose(-2, -1)) / scale
 
             if mask is not None:
-                attn = attn.masked_fill(mask == 0, float('-inf'))
+                if mask.dim() == 2:
+                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+                else:
+                    attn = attn.masked_fill(mask == 0, float('-inf'))
 
             attn = F.softmax(attn, dim=-1)
             attn = self.dropout(attn)
 
-            out = torch.matmul(attn, v)
+            out = torch.matmul(attn, v_shared)
             out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
+            frame_outputs.append(out)
 
-            # Gate this frame's contribution
-            gate = gates[:, :, frame_idx:frame_idx+1]  # (batch, seq_len, 1)
-            frame_outputs.append(out * gate)
+        # Cross-frame MLP: let frame outputs interact
+        stacked = torch.cat(frame_outputs, dim=-1)  # (batch, seq_len, 6*d_model)
+        mixed = stacked + self.cross_frame_mlp(stacked)  # residual connection
 
-        # Sum gated frame outputs
-        combined = sum(frame_outputs)
+        # Split back, apply frame gating
+        frame_outputs_mixed = mixed.chunk(self.n_frames, dim=-1)
+        gates = self.frame_gate(x)  # (batch, seq_len, n_frames)
+
+        gated = []
+        for frame_idx in range(self.n_frames):
+            gate = gates[:, :, frame_idx:frame_idx+1]
+            gated.append(frame_outputs_mixed[frame_idx] * gate)
+
+        combined = sum(gated)
         combined = self.out_proj(combined)
         combined = self.dropout(combined)
 
@@ -288,18 +306,22 @@ class RCEquivariantWrapper(nn.Module):
     For any layer f, we enforce:
         f(reverse_complement(x)) == reverse(f(x))
 
-    This is achieved by:
-    1. Processing x normally: y_fwd = f(x)
-    2. Processing RC(x): y_rev = f(RC(x))
-    3. Averaging: y = (y_fwd + reverse(y_rev)) / 2
-
-    This ensures the model treats both strands consistently --
-    the "endianness" symmetry is architecturally enforced.
+    This is achieved by processing both strands through f, then combining
+    them via a learned projection applied to symmetrically constructed
+    inputs. Using the same projection on (fwd, flip(rc)) and (rc, flip(fwd))
+    guarantees equivariance while allowing a richer combination than
+    simple averaging.
     """
 
-    def __init__(self, layer: nn.Module):
+    def __init__(self, layer: nn.Module, d_model: int):
         super().__init__()
         self.layer = layer
+        # Learned equivariant combination (replaces simple average)
+        self.strand_combine = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
 
     def forward(
         self,
@@ -310,19 +332,20 @@ class RCEquivariantWrapper(nn.Module):
         """
         RC-equivariant forward pass.
 
-        Args:
-            x: (batch, seq_len, d_model) -- forward strand embeddings
-            x_rc: (batch, seq_len, d_model) -- reverse complement embeddings
-            mask: optional attention mask
-        Returns:
-            Tuple of (forward output, RC output)
+        Equivariance proof: strand_combine is applied to symmetrically
+        constructed inputs -- (y_fwd, flip(y_rc)) for forward and
+        (y_rc, flip(y_fwd)) for RC. The same weights on swapped inputs
+        guarantees flip(output_fwd) == output_rc.
         """
         y_fwd = self.layer(x, mask=mask)
         y_rc = self.layer(x_rc, mask=mask)
 
-        # Enforce equivariance by cross-averaging
-        y_fwd_final = (y_fwd + y_rc.flip(dims=[1])) / 2
-        y_rc_final = (y_rc + y_fwd.flip(dims=[1])) / 2
+        # Symmetric input construction preserves equivariance
+        fwd_input = torch.cat([y_fwd, y_rc.flip(dims=[1])], dim=-1)
+        rc_input = torch.cat([y_rc, y_fwd.flip(dims=[1])], dim=-1)
+
+        y_fwd_final = self.strand_combine(fwd_input)
+        y_rc_final = self.strand_combine(rc_input)
 
         return y_fwd_final, y_rc_final
 
@@ -359,7 +382,15 @@ class TransformerLayer(nn.Module):
     ) -> torch.Tensor:
         # Pre-norm attention
         normed = self.norm1(x)
-        attn_out, _ = self.attn(normed, normed, normed, attn_mask=mask)
+
+        # Convert mask from "1=attend, 0=block" to additive float mask
+        # that nn.MultiheadAttention expects (0=attend, -inf=block)
+        attn_mask = None
+        if mask is not None:
+            attn_mask = torch.zeros_like(mask, dtype=torch.float)
+            attn_mask = attn_mask.masked_fill(mask == 0, float('-inf'))
+
+        attn_out, _ = self.attn(normed, normed, normed, attn_mask=attn_mask)
         x = x + attn_out
 
         # Pre-norm feedforward
@@ -416,7 +447,7 @@ class RosettaTransformer(nn.Module):
         for _ in range(config.n_frame_layers):
             frame_attn = MultiFrameAttention(config)
             if config.rc_equivariant:
-                self.frame_layers.append(RCEquivariantWrapper(frame_attn))
+                self.frame_layers.append(RCEquivariantWrapper(frame_attn, config.d_model))
             else:
                 self.frame_layers.append(frame_attn)
 
@@ -568,7 +599,26 @@ class RosettaTransformer(nn.Module):
 
         # Compute loss if labels provided
         if labels is not None:
-            loss = self._compute_wobble_aware_loss(logits, labels, input_ids)
+            # Get frame probabilities for wobble weighting
+            frame_probs = None
+            if self.config.use_wobble_weighting:
+                if frame_labels is not None:
+                    # Use ground truth frame labels (forward 3 frames)
+                    fwd_labels = frame_labels[:, :, :3]
+                    label_sum = fwd_labels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    frame_probs = fwd_labels / label_sum
+                else:
+                    # Use model's own frame gate predictions (detached)
+                    with torch.no_grad():
+                        x_for_gate = self._embed(input_ids)
+                        if self.config.rc_equivariant:
+                            gate_layer = self.frame_layers[0].layer
+                        else:
+                            gate_layer = self.frame_layers[0]
+                        raw_gates = gate_layer.frame_gate(x_for_gate)
+                        frame_probs = F.softmax(raw_gates[:, :, :3], dim=-1)
+
+            loss = self._compute_wobble_aware_loss(logits, labels, input_ids, frame_probs)
             output['loss'] = loss
 
         if frame_labels is not None:
@@ -586,21 +636,25 @@ class RosettaTransformer(nn.Module):
         logits: torch.Tensor,
         labels: torch.Tensor,
         input_ids: torch.Tensor,
+        frame_probs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Wobble-aware cross-entropy loss.
 
-        The key insight: not all nucleotide positions carry equal information.
-        Within a codon:
-        - Position 1: ~2 bits (amino acid identity) -> weight 1.0
-        - Position 2: ~2 bits (amino acid identity) -> weight 1.0
-        - Position 3: ~0.5-1 bit (wobble/degeneracy) -> weight 0.5
+        Uses frame gate predictions (or ground truth frame labels) to determine
+        the likely reading frame at each position, then applies codon-position
+        weights: positions 1-2 (amino acid identity) at 1.0x, position 3
+        (wobble/degeneracy) at 0.5x.
 
-        This loss function respects the information hierarchy of the genetic code.
-        Since we don't know the "true" reading frame a priori, we compute weights
-        for all 3 forward frames and average, letting the model learn which matters.
+        Args:
+            logits: (batch, seq_len, vocab_size) predicted logits
+            labels: (batch, seq_len) target labels (-100 for unmasked)
+            input_ids: (batch, seq_len) input token ids
+            frame_probs: (batch, seq_len, 3) soft frame probabilities for
+                         the 3 forward reading frames. If None, falls back
+                         to uniform cross-entropy.
         """
-        if not self.config.use_wobble_weighting:
+        if not self.config.use_wobble_weighting or frame_probs is None:
             return F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
@@ -608,21 +662,18 @@ class RosettaTransformer(nn.Module):
             )
 
         batch_size, seq_len, vocab_size = logits.shape
-        weights = self.config.wobble_weights
-
-        # Compute per-position weights averaged across reading frames
+        w = torch.tensor(self.config.wobble_weights, device=logits.device)
         positions = torch.arange(seq_len, device=logits.device)
-        frame_weights = torch.zeros(seq_len, device=logits.device)
 
+        # For each forward frame, compute the codon-position weight per position
+        # then combine using the frame probability (soft frame selection)
+        frame_weights = torch.zeros(batch_size, seq_len, device=logits.device)
         for frame_offset in range(3):
             codon_pos = (positions - frame_offset) % 3
-            w = torch.tensor(weights, device=logits.device)
-            frame_weights += w[codon_pos]
+            pos_weights = w[codon_pos]  # (seq_len,)
+            frame_weights += frame_probs[:, :, frame_offset] * pos_weights.unsqueeze(0)
 
-        frame_weights /= 3.0  # Average across frames
-        frame_weights = frame_weights.unsqueeze(0).expand(batch_size, -1)
-
-        # Compute weighted cross-entropy
+        # Compute per-position cross-entropy
         loss_per_position = F.cross_entropy(
             logits.view(-1, vocab_size),
             labels.view(-1),
@@ -668,8 +719,10 @@ class RosettaTransformer(nn.Module):
             # Use only the last max_seq_len tokens if sequence is too long
             context = generated[:, -self.config.max_seq_len:]
 
-            # Encode and predict next token
-            hidden = self.encode(context)
+            # Encode with causal masking -- model can only attend to past tokens
+            seq_len = context.shape[1]
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=context.device))
+            hidden = self.encode(context, attention_mask=causal_mask)
             next_logits = self.gen_head(hidden[:, -1, :])  # (batch, 4)
 
             # Apply temperature

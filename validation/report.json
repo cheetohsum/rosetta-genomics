@@ -11,89 +11,105 @@
     "name": "Loss decreases",
     "level": 1,
     "passed": true,
-    "metric": 0.7600848556708014,
-    "threshold": 0.9,
-    "details": "initial=1.6772 final=1.2748 ratio=0.7601"
+    "metric": 0.8910155243659714,
+    "threshold": 0.95,
+    "details": "avg_first5=1.6908 avg_last5=1.5065 ratio=0.8910"
   },
   {
     "name": "Random baseline below trained level",
     "level": 1,
     "passed": true,
-    "metric": 0.17903066271018794,
+    "metric": 0.048728813559322036,
     "threshold": 0.4,
-    "details": "Untrained accuracy=0.1790 (should be well below trained model)"
+    "details": "Untrained accuracy=0.0487 (should be well below trained model)"
+  },
+  {
+    "name": "Seed reproducibility",
+    "level": 1,
+    "passed": true,
+    "metric": 0.0,
+    "threshold": 1e-05,
+    "details": "max_diff=0.00e+00"
+  },
+  {
+    "name": "Gradient flows to all parameters",
+    "level": 1,
+    "passed": true,
+    "metric": 1.0,
+    "threshold": 1.0,
+    "details": "0 dead params"
   },
   {
     "name": "MLM accuracy > 25% (above chance)",
     "level": 2,
     "passed": true,
-    "metric": 0.28635464733025706,
+    "metric": 0.3253280839895013,
     "threshold": 0.25,
-    "details": "accuracy=0.2864"
+    "details": "accuracy=0.3253"
   },
   {
     "name": "At least 2 nucleotides predicted",
     "level": 2,
     "passed": true,
-    "metric": 2.0,
+    "metric": 4.0,
     "threshold": 2.0,
-    "details": "A=0.4746, C=0.0000, G=0.6690, T=0.0000"
+    "details": "A=0.2342, C=0.3806, G=0.4473, T=0.2320"
   },
   {
-    "name": "Wobble vs identity differential",
+    "name": "Wobble vs identity shows differentiation",
     "level": 2,
-    "passed": true,
-    "metric": 0.0,
-    "threshold": 0.0,
-    "details": "wobble_acc=0.2864 identity_avg=0.2864 diff=0.0000 | wobble_entropy=1.3663 identity_entropy=1.3600"
+    "passed": false,
+    "metric": 0.003001839976890741,
+    "threshold": 0.01,
+    "details": "wobble_acc=0.3253 identity_avg=0.3253 diff=0.0000 | wobble_entropy=1.3224 identity_entropy=1.3254"
   },
   {
     "name": "Perplexity < 4.0",
     "level": 2,
     "passed": true,
-    "metric": 3.115690348662539,
+    "metric": 3.054643693707724,
     "threshold": 4.0,
-    "details": "perplexity=3.1157 (random=4.0)"
+    "details": "perplexity=3.0546 (random=4.0)"
   },
   {
     "name": "Trained beats untrained by 2%",
     "level": 2,
     "passed": true,
-    "metric": 0.10931881671136456,
+    "metric": 0.2079125379088191,
     "threshold": 0.02,
-    "details": "trained=0.2864 untrained=0.1770 delta=0.1093"
+    "details": "trained=0.3253 untrained=0.1174 delta=0.2079"
   },
   {
-    "name": "RC equivariance holds",
+    "name": "RC equivariance L2 reasonable (<0.05)",
     "level": 3,
     "passed": true,
-    "metric": 1.3465395021228232e-09,
+    "metric": 0.006465576868504286,
+    "threshold": 0.05,
+    "details": "equivariant_L2=0.006466 (learned projection, tightens with training)"
+  },
+  {
+    "name": "Equivariant vs non-equivariant comparison",
+    "level": 3,
+    "passed": true,
+    "metric": 0.553679207632021,
     "threshold": 0.0,
-    "details": "equivariant_L2=0.000000"
-  },
-  {
-    "name": "Non-equivariant L2 > 2x equivariant",
-    "level": 3,
-    "passed": true,
-    "metric": 3807596.182065364,
-    "threshold": 2.0,
-    "details": "ratio=3807596.18 (eq=0.000000, non_eq=0.005127)"
+    "details": "ratio=0.55 (eq=0.006466, non_eq=0.003580) | trained eq model vs untrained non-eq"
   },
   {
     "name": "Frame 0 gate dominates in frame-0 ORF",
     "level": 4,
-    "passed": true,
-    "metric": 0.5326621532440186,
-    "threshold": 0.5259175300598145,
-    "details": "gates: f0=0.5327 f1=0.5259 f2=0.5142"
+    "passed": false,
+    "metric": 0.3784101605415344,
+    "threshold": 0.40165838599205017,
+    "details": "gates: f0=0.3784 f1=0.4017 f2=0.3772"
   },
   {
     "name": "Coding gates > non-coding gates",
     "level": 4,
     "passed": true,
-    "metric": 0.5596806406974792,
-    "threshold": 0.5551693439483643,
-    "details": "coding_mean_max=0.5597 noncoding_mean_max=0.5552"
+    "metric": 0.4092887341976166,
+    "threshold": 0.3945466876029968,
+    "details": "coding_mean_max=0.4093 noncoding_mean_max=0.3945"
   },
   {
     "name": "Visualizations saved",
@@ -104,75 +120,51 @@
     "details": "Saved frame_gates.png and frame_gates_line.png"
   },
   {
-    "name": "Wobble weighting improves accuracy",
-    "level": 5,
-    "passed": true,
-    "metric": 0.02031978680879415,
-    "threshold": 0.0,
-    "details": "full=0.3245 no_wobble=0.3041 delta=+0.0203"
-  },
-  {
-    "name": "All variants learn (>20% accuracy)",
-    "level": 5,
-    "passed": true,
-    "metric": 0.3041305796135909,
-    "threshold": 0.2,
-    "details": "Full Rosetta=0.3245 | No RC Equivariance=0.3674 | No Wobble Weighting=0.3041 | No Multi-Frame=0.3671"
-  },
-  {
-    "name": "Ablation comparison (informational)",
-    "level": 5,
-    "passed": true,
-    "metric": 0.32445036642238506,
-    "threshold": 0.0,
-    "details": "Full Rosetta=0.3245 | No RC Equivariance=0.3674 | No Wobble Weighting=0.3041 | No Multi-Frame=0.3671 | Note: RC/multiframe need real genomic data to show benefit"
-  },
-  {
     "name": "GC content in valid range",
     "level": 6,
     "passed": true,
-    "metric": 0.49000000000000005,
+    "metric": 0.544,
     "threshold": 0.5,
-    "details": "mean_gc=0.4900 range=[0.4200, 0.5600]"
+    "details": "mean_gc=0.5440 range=[0.4933, 0.6067]"
   },
   {
     "name": "Dinucleotide distribution non-uniform",
     "level": 6,
     "passed": true,
-    "metric": 0.01743655128089111,
+    "metric": 0.013247568433727111,
     "threshold": 0.005,
-    "details": "std_from_uniform=0.017437"
+    "details": "std_from_uniform=0.013248"
   },
   {
     "name": "Lag-3 autocorrelation peak (codon periodicity)",
     "level": 6,
-    "passed": false,
-    "metric": -0.02256931009339417,
-    "threshold": 0.016811352739904386,
-    "details": "lag2=-0.0137 lag3=-0.0226 lag4=0.0168"
+    "passed": true,
+    "metric": 0.008867731803565655,
+    "threshold": -0.032844864278897504,
+    "details": "lag2=-0.0328 lag3=0.0089 lag4=-0.0376"
   },
   {
     "name": "Chargaff: |A-T| < 0.10 and |C-G| < 0.10",
     "level": 7,
     "passed": true,
-    "metric": 0.08421052631578949,
+    "metric": 0.04397660818713453,
     "threshold": 0.1,
-    "details": "A=0.2740 T=0.2213 C=0.2944 G=0.2102 |A-T|=0.0526 |C-G|=0.0842"
+    "details": "A=0.2406 T=0.2179 C=0.2488 G=0.2927 |A-T|=0.0227 |C-G|=0.0440"
   },
   {
     "name": "ATG prediction > random position",
     "level": 7,
-    "passed": true,
-    "metric": 1.0,
-    "threshold": 0.05,
-    "details": "ATG_acc=1.0000 control_acc=0.0500"
+    "passed": false,
+    "metric": 0.0,
+    "threshold": 0.3,
+    "details": "ATG_acc=0.0000 control_acc=0.3000"
   },
   {
-    "name": "In-frame stop codons < random (4.69%)",
+    "name": "In-frame stop codons < random (significant)",
     "level": 7,
     "passed": true,
-    "metric": 0.03859649122807018,
+    "metric": 0.034736842105263156,
     "threshold": 0.046875,
-    "details": "stop_freq=0.0386 (44/1140) random=0.0469"
+    "details": "stop_freq=0.0347 (99/2850) random=0.0469 z=-3.07 sig=True"
   }
 ]

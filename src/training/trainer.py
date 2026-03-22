@@ -89,6 +89,9 @@ class RosettaTrainer:
         # Tracking
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.patience = 5
+        self.patience_counter = 0
+        self.last_grad_norm = 0.0
 
     def get_lr(self, step: int) -> float:
         """Learning rate with warmup + cosine decay."""
@@ -130,13 +133,19 @@ class RosettaTrainer:
                 )
                 loss = outputs['loss'] / self.config.gradient_accumulation_steps
 
+                # NaN detection
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"  WARNING: NaN/Inf loss at step {self.global_step}, skipping batch")
+                    self.optimizer.zero_grad()
+                    continue
+
                 # Backward
                 loss.backward()
 
                 # Update weights
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    # Gradient clipping (returns the total norm)
+                    self.last_grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), 1.0).item()
 
                     # Update learning rate
                     lr = self.get_lr(self.global_step)
@@ -160,6 +169,7 @@ class RosettaTrainer:
                         f"  Epoch {epoch+1} | Step {epoch_steps} | "
                         f"Loss: {avg_loss:.4f} | "
                         f"LR: {self.get_lr(self.global_step):.2e} | "
+                        f"GradNorm: {self.last_grad_norm:.4f} | "
                         f"Tok/s: {tokens_per_sec:.0f}"
                     )
 
@@ -179,7 +189,14 @@ class RosettaTrainer:
 
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
+                    self.patience_counter = 0
                     self.save_checkpoint("best")
+                else:
+                    self.patience_counter += 1
+                    if self.patience_counter >= self.patience:
+                        print(f"  Early stopping: no improvement for {self.patience} epochs")
+                        self.save_checkpoint(f"epoch_{epoch+1}")
+                        break
 
             # Save periodic checkpoint
             self.save_checkpoint(f"epoch_{epoch+1}")
