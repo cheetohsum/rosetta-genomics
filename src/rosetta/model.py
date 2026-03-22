@@ -218,6 +218,9 @@ class MultiFrameAttention(nn.Module):
             nn.GELU(),
             nn.Linear(config.d_model * 2, config.n_frames * config.d_model),
         )
+        # Learnable scale for cross-frame residual — starts small but can grow,
+        # preventing the MLP from being a no-op due to small weight initialization
+        self.cross_frame_scale = nn.Parameter(torch.tensor(0.1))
 
         # Frame gate: learns which frames are active at each position
         # Uses softmax (not sigmoid) to force competition between frames --
@@ -280,7 +283,7 @@ class MultiFrameAttention(nn.Module):
 
         # Cross-frame MLP: let frame outputs interact
         stacked = torch.cat(frame_outputs, dim=-1)  # (batch, seq_len, 6*d_model)
-        mixed = stacked + self.cross_frame_mlp(stacked)  # residual connection
+        mixed = stacked + self.cross_frame_scale * self.cross_frame_mlp(stacked)
 
         # Split back, apply frame gating
         frame_outputs_mixed = mixed.chunk(self.n_frames, dim=-1)
@@ -330,7 +333,8 @@ class RCEquivariantWrapper(nn.Module):
         self,
         x: torch.Tensor,
         x_rc: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
+        mask: Optional[torch.Tensor] = None,
+        rc_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         RC-equivariant forward pass.
@@ -341,7 +345,7 @@ class RCEquivariantWrapper(nn.Module):
         guarantees flip(output_fwd) == output_rc.
         """
         y_fwd = self.layer(x, mask=mask)
-        y_rc = self.layer(x_rc, mask=mask)
+        y_rc = self.layer(x_rc, mask=rc_mask if rc_mask is not None else mask)
 
         # Symmetric input construction preserves equivariance
         fwd_input = torch.cat([y_fwd, y_rc.flip(dims=[1])], dim=-1)
@@ -549,12 +553,17 @@ class RosettaTransformer(nn.Module):
         x_rc = self._create_rc_embeddings(input_ids)
 
         # Multi-frame attention layers with RC equivariance
+        # RC strand positions are reversed, so flip the causal mask
+        rc_mask = attention_mask
+        if attention_mask is not None and attention_mask.dim() == 2:
+            rc_mask = attention_mask.flip(dims=[0, 1])
+
         for layer in self.frame_layers:
             if self.config.rc_equivariant:
-                x_fwd, x_rc = layer(x_fwd, x_rc, mask=attention_mask)
+                x_fwd, x_rc = layer(x_fwd, x_rc, mask=attention_mask, rc_mask=rc_mask)
             else:
                 x_fwd = layer(x_fwd, mask=attention_mask)
-                x_rc = layer(x_rc, mask=attention_mask)
+                x_rc = layer(x_rc, mask=rc_mask)
 
         # Fuse forward and reverse complement representations
         # This is where both "endiannesses" merge into a unified representation
@@ -619,7 +628,9 @@ class RosettaTransformer(nn.Module):
                         else:
                             gate_layer = self.frame_layers[0]
                         raw_gates = F.softmax(gate_layer.frame_gate_proj(x_for_gate), dim=-1)
-                        frame_probs = F.softmax(raw_gates[:, :, :3], dim=-1)
+                        # Extract forward 3 frames and renormalize (NOT double softmax)
+                        fwd_gates = raw_gates[:, :, :3]
+                        frame_probs = fwd_gates / fwd_gates.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
             loss = self._compute_wobble_aware_loss(logits, labels, input_ids, frame_probs)
             output['loss'] = loss

@@ -211,7 +211,10 @@ class FASTADataset(Dataset):
                 start = int(parts[3]) - 1  # GFF is 1-based
                 end = int(parts[4])
                 strand = 0 if parts[6] == '+' else 1
-                frame = int(parts[7]) if parts[7].isdigit() else 0
+                # Reading frame from absolute genome position, not GFF phase.
+                # GFF phase is "bases to skip before first codon" within the CDS,
+                # but our frame convention is position % 3 in genome coordinates.
+                frame = start % 3
 
                 # Assign to first sequence (single-chromosome genomes)
                 if annotations:

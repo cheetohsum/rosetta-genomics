@@ -95,8 +95,8 @@ def create_fresh_model(config: RosettaConfig, device: torch.device) -> RosettaTr
 
 def get_ecoli_dataset(seq_length: int) -> Optional[FASTADataset]:
     try:
-        fasta_path = download_sample_genome()
-        return FASTADataset(fasta_path, seq_length=seq_length)
+        fasta_path, gff_path = download_sample_genome()
+        return FASTADataset(fasta_path, seq_length=seq_length, gff_path=gff_path)
     except Exception as e:
         print(f"  Could not load E. coli genome: {e}")
         return None
@@ -171,31 +171,34 @@ def compute_mlm_accuracy(
                 per_nt_correct[nt_idx] += ((preds == nt_idx) & nt_mask).sum().item()
                 per_nt_total[nt_idx] += nt_mask.sum().item()
 
-            # Per-codon-position accuracy and entropy
+            # Per-codon-position accuracy and entropy using model's predicted frame
             if return_per_position:
                 seq_len = input_ids.shape[1]
                 positions = torch.arange(seq_len, device=device)
                 probs = F.softmax(logits, dim=-1)
 
-                for frame_offset in range(3):
-                    codon_pos = (positions - frame_offset) % 3
-                    for cp in range(3):
-                        cp_mask = (codon_pos == cp).unsqueeze(0).expand_as(mask) & mask
-                        per_codon_pos_correct[(frame_offset, cp)] += (correct & cp_mask).sum().item()
-                        per_codon_pos_total[(frame_offset, cp)] += cp_mask.sum().item()
+                # Get the model's predicted dominant frame at each position
+                frame_gates = model.get_frame_attention_map(input_ids)  # (batch, seq_len, 6)
+                # Take forward 3 frames, find dominant
+                dominant_frame = frame_gates[:, :, :3].argmax(dim=-1)  # (batch, seq_len)
 
-                # Entropy at wobble vs identity (using frame 0)
-                codon_pos_f0 = positions % 3
-                for pos_idx in range(seq_len):
-                    if not mask[0, pos_idx]:
-                        continue
-                    p = probs[0, pos_idx, :4]
-                    p = p / p.sum().clamp(min=1e-8)
-                    entropy = -(p * p.log().clamp(min=-100)).sum().item()
-                    if codon_pos_f0[pos_idx] == 2:
-                        wobble_entropies.append(entropy)
-                    else:
-                        identity_entropies.append(entropy)
+                for b in range(input_ids.shape[0]):
+                    for pos_idx in range(seq_len):
+                        if not mask[b, pos_idx]:
+                            continue
+                        dom_f = dominant_frame[b, pos_idx].item()
+                        cp = (pos_idx - dom_f) % 3  # codon position in dominant frame
+                        per_codon_pos_correct[cp] += correct[b, pos_idx].item()
+                        per_codon_pos_total[cp] += 1
+
+                        # Entropy analysis
+                        p = probs[b, pos_idx, :4]
+                        p = p / p.sum().clamp(min=1e-8)
+                        entropy = -(p * p.log().clamp(min=-100)).sum().item()
+                        if cp == 2:  # wobble position in dominant frame
+                            wobble_entropies.append(entropy)
+                        else:
+                            identity_entropies.append(entropy)
 
     accuracy = total_correct / max(total_masked, 1)
     avg_loss = total_loss / max(loss_count, 1)
@@ -205,13 +208,11 @@ def compute_mlm_accuracy(
     for nt_idx in range(4):
         per_nt_acc[nt_idx] = per_nt_correct[nt_idx] / max(per_nt_total[nt_idx], 1)
 
-    # Average codon position accuracy across frames
+    # Codon position accuracy using model's predicted dominant frame
     per_codon_pos_acc = {}
     if return_per_position:
         for cp in range(3):
-            total_c = sum(per_codon_pos_correct.get((f, cp), 0) for f in range(3))
-            total_t = sum(per_codon_pos_total.get((f, cp), 0) for f in range(3))
-            per_codon_pos_acc[cp] = total_c / max(total_t, 1)
+            per_codon_pos_acc[cp] = per_codon_pos_correct.get(cp, 0) / max(per_codon_pos_total.get(cp, 0), 1)
 
     result = {
         'accuracy': accuracy,
