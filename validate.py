@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from src.rosetta.config import RosettaConfig
-from src.rosetta.model import RosettaTransformer, reverse_complement
+from src.rosetta.model import RosettaTransformer, reverse_complement, build_codon_weight_table
 from src.data.tokenizer import DNATokenizer
 from src.data.dataset import GenomicDataset, FASTADataset, download_sample_genome
 
@@ -481,6 +481,36 @@ def level1_sanity_checks(device: torch.device) -> list[ValidationResult]:
     except Exception as e:
         results.append(ValidationResult(
             name="Gradient flows to all parameters", level=1, passed=False,
+            metric=0.0, threshold=1.0, details=f"Exception: {e}",
+        ))
+        print(f"    FAILED: {e}")
+
+    # --- 1f: Codon weight table correctness ---
+    print("\n  1f. Codon weight table biological correctness...")
+    try:
+        table = build_codon_weight_table()
+        A, C, G, T = 0, 1, 2, 3
+
+        checks = [
+            (table[A, T, G, 2].item() == 1.0, "Met(ATG) pos2=1.0"),
+            (table[T, G, G, 2].item() == 1.0, "Trp(TGG) pos2=1.0"),
+            (table[G, C, T, 2].item() == 0.25, "Ala(GCT) pos2=0.25"),
+            (abs(table[A, T, T, 2].item() - 1/3) < 0.01, "Ile(ATT) pos2=0.333"),
+            (table[T, T, T, 2].item() == 0.5, "Phe(TTT) pos2=0.5"),
+            (table[C, T, A, 0].item() == 0.5, "Leu(CTA) pos0=0.5"),
+        ]
+        all_ok = all(ok for ok, _ in checks)
+        details = " | ".join(desc for _, desc in checks)
+
+        results.append(ValidationResult(
+            name="Codon weight table biologically correct", level=1, passed=all_ok,
+            metric=1.0 if all_ok else 0.0, threshold=1.0,
+            details=details,
+        ))
+        print(f"    {sum(1 for ok, _ in checks if ok)}/{len(checks)} checks passed")
+    except Exception as e:
+        results.append(ValidationResult(
+            name="Codon weight table biologically correct", level=1, passed=False,
             metric=0.0, threshold=1.0, details=f"Exception: {e}",
         ))
         print(f"    FAILED: {e}")

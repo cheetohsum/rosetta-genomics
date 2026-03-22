@@ -59,4 +59,5 @@ class RosettaConfig:
     # Position 2: ~2 bits (high significance)
     # Position 3: ~0.5-1 bit (wobble -- lower significance for amino acid identity,
     #              but carries secondary regulatory info)
-    wobble_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 0.5])
+    wobble_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 0.5])  # fallback
+    use_codon_weights: bool = True  # per-codon degeneracy weights (overrides wobble_weights)

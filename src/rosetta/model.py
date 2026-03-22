@@ -49,6 +49,69 @@ def reverse_complement(seq: torch.Tensor) -> torch.Tensor:
 
 
 # =============================================================================
+# Per-Codon Degeneracy Weight Table
+# =============================================================================
+
+# Standard genetic code indexed by nucleotide tokens (A=0, C=1, G=2, T=3)
+_CODON_TABLE = {
+    (0,0,0): 'K', (0,0,1): 'N', (0,0,2): 'K', (0,0,3): 'N',
+    (0,1,0): 'T', (0,1,1): 'T', (0,1,2): 'T', (0,1,3): 'T',
+    (0,2,0): 'R', (0,2,1): 'S', (0,2,2): 'R', (0,2,3): 'S',
+    (0,3,0): 'I', (0,3,1): 'I', (0,3,2): 'M', (0,3,3): 'I',
+    (1,0,0): 'Q', (1,0,1): 'H', (1,0,2): 'Q', (1,0,3): 'H',
+    (1,1,0): 'P', (1,1,1): 'P', (1,1,2): 'P', (1,1,3): 'P',
+    (1,2,0): 'R', (1,2,1): 'R', (1,2,2): 'R', (1,2,3): 'R',
+    (1,3,0): 'L', (1,3,1): 'L', (1,3,2): 'L', (1,3,3): 'L',
+    (2,0,0): 'E', (2,0,1): 'D', (2,0,2): 'E', (2,0,3): 'D',
+    (2,1,0): 'A', (2,1,1): 'A', (2,1,2): 'A', (2,1,3): 'A',
+    (2,2,0): 'G', (2,2,1): 'G', (2,2,2): 'G', (2,2,3): 'G',
+    (2,3,0): 'V', (2,3,1): 'V', (2,3,2): 'V', (2,3,3): 'V',
+    (3,0,0): '*', (3,0,1): 'Y', (3,0,2): '*', (3,0,3): 'Y',
+    (3,1,0): 'S', (3,1,1): 'S', (3,1,2): 'S', (3,1,3): 'S',
+    (3,2,0): '*', (3,2,1): 'C', (3,2,2): 'W', (3,2,3): 'C',
+    (3,3,0): 'L', (3,3,1): 'F', (3,3,2): 'L', (3,3,3): 'F',
+}
+
+
+def build_codon_weight_table() -> torch.Tensor:
+    """
+    Build a (4, 4, 4, 3) lookup table of degeneracy-based weights.
+
+    For codon (n0, n1, n2) at intra-codon position p:
+      - Fix the other two positions, vary position p over all 4 nucleotides
+      - Count how many produce the SAME amino acid
+      - weight = 1.0 / count
+
+    Examples:
+      Ala = GCx (4-fold at pos 2): weight = 0.25
+      Met = ATG (non-degenerate):   weight = 1.0
+      Phe = TT(T/C) (2-fold):      weight = 0.5
+    """
+    table = torch.ones(4, 4, 4, 3)
+
+    for n0 in range(4):
+        for n1 in range(4):
+            for n2 in range(4):
+                aa = _CODON_TABLE.get((n0, n1, n2))
+                if aa is None:
+                    continue
+
+                # Position 0: vary n0, fix n1, n2
+                deg_p0 = sum(1 for v in range(4) if _CODON_TABLE.get((v, n1, n2)) == aa)
+                table[n0, n1, n2, 0] = 1.0 / deg_p0
+
+                # Position 1: vary n1, fix n0, n2
+                deg_p1 = sum(1 for v in range(4) if _CODON_TABLE.get((n0, v, n2)) == aa)
+                table[n0, n1, n2, 1] = 1.0 / deg_p1
+
+                # Position 2: vary n2, fix n0, n1
+                deg_p2 = sum(1 for v in range(4) if _CODON_TABLE.get((n0, n1, v)) == aa)
+                table[n0, n1, n2, 2] = 1.0 / deg_p2
+
+    return table
+
+
+# =============================================================================
 # Codon Position Encoding
 # =============================================================================
 
@@ -499,6 +562,12 @@ class RosettaTransformer(nn.Module):
 
         self._init_weights()
 
+        # Per-codon degeneracy weight table (static, rebuilt on construction)
+        if config.use_codon_weights:
+            self.register_buffer(
+                'codon_weight_table', build_codon_weight_table(), persistent=False
+            )
+
     def _init_weights(self):
         """Initialize weights with small values for stable training."""
         for module in self.modules():
@@ -645,6 +714,61 @@ class RosettaTransformer(nn.Module):
 
         return output
 
+    def _compute_codon_frame_weights(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        frame_probs: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """
+        Vectorized per-codon weight lookup across all 3 forward frames.
+
+        Reconstructs the original sequence, then for each frame gathers
+        the 3 nucleotides of each position's codon and looks up the
+        degeneracy weight from self.codon_weight_table.
+        """
+        device = input_ids.device
+
+        # Reconstruct original sequence (unmask)
+        original = input_ids.clone()
+        known = labels != -100
+        original[known] = labels[known]
+
+        # Clamp to valid nucleotide range [0, 3] (special tokens → 0)
+        safe_seq = original.clamp(0, 3)
+
+        positions = torch.arange(seq_len, device=device)
+        fallback_w = torch.tensor(self.config.wobble_weights, device=device)
+        frame_weights = torch.zeros(batch_size, seq_len, device=device)
+
+        for f in range(3):
+            codon_pos = (positions - f) % 3
+            codon_start = positions - codon_pos
+
+            # Valid = codon fully within sequence
+            valid = (codon_start >= 0) & (codon_start + 2 < seq_len)
+            cs = codon_start.clamp(0, max(seq_len - 3, 0))
+
+            # Gather codon nucleotides
+            n0 = safe_seq[:, cs]
+            n1 = safe_seq[:, cs + 1]
+            n2 = safe_seq[:, cs + 2]
+            cp = codon_pos.unsqueeze(0).expand(batch_size, -1)
+
+            # Lookup per-codon degeneracy weight
+            w = self.codon_weight_table[n0, n1, n2, cp]
+
+            # Fallback for boundary positions
+            if not valid.all():
+                fallback = fallback_w[codon_pos]
+                w[:, ~valid] = fallback[~valid].unsqueeze(0)
+
+            frame_weights += frame_probs[:, :, f] * w
+
+        return frame_weights
+
     def _compute_wobble_aware_loss(
         self,
         logits: torch.Tensor,
@@ -653,20 +777,12 @@ class RosettaTransformer(nn.Module):
         frame_probs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Wobble-aware cross-entropy loss.
+        Wobble-aware cross-entropy loss with per-codon degeneracy weighting.
 
-        Uses frame gate predictions (or ground truth frame labels) to determine
-        the likely reading frame at each position, then applies codon-position
-        weights: positions 1-2 (amino acid identity) at 1.0x, position 3
-        (wobble/degeneracy) at 0.5x.
-
-        Args:
-            logits: (batch, seq_len, vocab_size) predicted logits
-            labels: (batch, seq_len) target labels (-100 for unmasked)
-            input_ids: (batch, seq_len) input token ids
-            frame_probs: (batch, seq_len, 3) soft frame probabilities for
-                         the 3 forward reading frames. If None, falls back
-                         to uniform cross-entropy.
+        When use_codon_weights is True, each position's weight is derived
+        from the actual degeneracy of its codon (e.g., Met ATG pos3 = 1.0,
+        Ala GCx pos3 = 0.25). Falls back to fixed [1.0, 1.0, 0.5] weights
+        when codon context is unavailable.
         """
         if not self.config.use_wobble_weighting or frame_probs is None:
             return F.cross_entropy(
@@ -676,18 +792,22 @@ class RosettaTransformer(nn.Module):
             )
 
         batch_size, seq_len, vocab_size = logits.shape
-        w = torch.tensor(self.config.wobble_weights, device=logits.device)
-        positions = torch.arange(seq_len, device=logits.device)
 
-        # For each forward frame, compute the codon-position weight per position
-        # then combine using the frame probability (soft frame selection)
-        frame_weights = torch.zeros(batch_size, seq_len, device=logits.device)
-        for frame_offset in range(3):
-            codon_pos = (positions - frame_offset) % 3
-            pos_weights = w[codon_pos]  # (seq_len,)
-            frame_weights += frame_probs[:, :, frame_offset] * pos_weights.unsqueeze(0)
+        # Per-codon weights or fixed fallback
+        if self.config.use_codon_weights and hasattr(self, 'codon_weight_table'):
+            frame_weights = self._compute_codon_frame_weights(
+                input_ids, labels, frame_probs, batch_size, seq_len
+            )
+        else:
+            w = torch.tensor(self.config.wobble_weights, device=logits.device)
+            positions = torch.arange(seq_len, device=logits.device)
+            frame_weights = torch.zeros(batch_size, seq_len, device=logits.device)
+            for frame_offset in range(3):
+                codon_pos = (positions - frame_offset) % 3
+                pos_weights = w[codon_pos]
+                frame_weights += frame_probs[:, :, frame_offset] * pos_weights.unsqueeze(0)
 
-        # Compute per-position cross-entropy
+        # Per-position cross-entropy
         loss_per_position = F.cross_entropy(
             logits.view(-1, vocab_size),
             labels.view(-1),
@@ -695,10 +815,7 @@ class RosettaTransformer(nn.Module):
             reduction='none'
         ).view(batch_size, seq_len)
 
-        # Apply wobble weighting
         weighted_loss = loss_per_position * frame_weights
-
-        # Mask out ignored positions
         valid_mask = (labels != -100).float()
         return (weighted_loss * valid_mask).sum() / valid_mask.sum().clamp(min=1)
 
