@@ -61,3 +61,14 @@ class RosettaConfig:
     #              but carries secondary regulatory info)
     wobble_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 0.5])  # fallback
     use_codon_weights: bool = True  # per-codon degeneracy weights (overrides wobble_weights)
+
+    # --- Regional Entropy Weighting ---
+    # Upweight information-dense regions (coding, regulatory), downweight repeats
+    use_entropy_weighting: bool = True
+    entropy_window: int = 31         # local window for entropy computation (odd number)
+    entropy_min_weight: float = 0.3  # floor to avoid suppressing any region to zero
+
+    # --- Strand Role Asymmetry ---
+    # Allow learned differences between template and coding strands
+    # (Gielis: both strands carry same info, but have different biological roles)
+    use_strand_asymmetry: bool = True

@@ -527,6 +527,14 @@ class RosettaTransformer(nn.Module):
             TransformerLayer(config) for _ in range(n_standard)
         ])
 
+        # --- Strand role asymmetry (Gielis: same info, different roles) ---
+        # Coding strand carries promoter signals, Shine-Dalgarno sequences;
+        # template strand is read by RNA polymerase. Residual projections
+        # let each strand develop role-specific features before fusion.
+        if config.use_strand_asymmetry:
+            self.fwd_strand_proj = nn.Linear(config.d_model, config.d_model)
+            self.rc_strand_proj = nn.Linear(config.d_model, config.d_model)
+
         # --- Strand fusion (merge forward + RC representations) ---
         self.strand_fusion = nn.Sequential(
             nn.Linear(config.d_model * 2, config.d_model),
@@ -634,8 +642,12 @@ class RosettaTransformer(nn.Module):
                 x_fwd = layer(x_fwd, mask=attention_mask)
                 x_rc = layer(x_rc, mask=rc_mask)
 
+        # Strand role asymmetry: apply strand-specific projections (residual)
+        if self.config.use_strand_asymmetry:
+            x_fwd = x_fwd + self.fwd_strand_proj(x_fwd)
+            x_rc = x_rc + self.rc_strand_proj(x_rc)
+
         # Fuse forward and reverse complement representations
-        # This is where both "endiannesses" merge into a unified representation
         x = self.strand_fusion(torch.cat([x_fwd, x_rc.flip(dims=[1])], dim=-1))
 
         # Standard transformer layers for deeper processing
@@ -769,6 +781,56 @@ class RosettaTransformer(nn.Module):
 
         return frame_weights
 
+    def _compute_entropy_weights(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute per-position entropy weights from local nucleotide distribution.
+
+        High-entropy regions (diverse coding/regulatory) get higher weight.
+        Low-entropy regions (repeats, poly-A) get lower weight.
+        Vectorized: uses 1D unfold for sliding window histogram.
+
+        Returns:
+            (batch, seq_len) weights in [entropy_min_weight, 1.0]
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        window = self.config.entropy_window
+        half_w = window // 2
+
+        # Reconstruct original sequence
+        original = input_ids.clone()
+        known = labels != -100
+        original[known] = labels[known]
+        safe_seq = original.clamp(0, 3)  # clamp special tokens to valid nucleotides
+
+        # One-hot encode: (batch, seq_len, 4)
+        one_hot = F.one_hot(safe_seq.long(), num_classes=4).float()
+
+        # Sliding window sum via 1D convolution
+        # Reshape to (batch, 4, seq_len) for conv1d
+        one_hot_t = one_hot.permute(0, 2, 1)  # (batch, 4, seq_len)
+        kernel = torch.ones(4, 1, window, device=device) / window
+        # Grouped conv: each of 4 channels independently
+        freqs = F.conv1d(one_hot_t, kernel, padding=half_w, groups=4)  # (batch, 4, seq_len)
+
+        # Shannon entropy: H = -sum(p * log(p))
+        freqs = freqs.clamp(min=1e-8)
+        entropy = -(freqs * freqs.log()).sum(dim=1)  # (batch, seq_len)
+
+        # Normalize to [0, 1] (max entropy = log(4) ≈ 1.386)
+        max_entropy = math.log(4)
+        entropy_norm = entropy / max_entropy
+
+        # Apply floor and scale to [min_weight, 1.0]
+        min_w = self.config.entropy_min_weight
+        weights = min_w + (1.0 - min_w) * entropy_norm
+
+        return weights
+
     def _compute_wobble_aware_loss(
         self,
         logits: torch.Tensor,
@@ -806,6 +868,11 @@ class RosettaTransformer(nn.Module):
                 codon_pos = (positions - frame_offset) % 3
                 pos_weights = w[codon_pos]
                 frame_weights += frame_probs[:, :, frame_offset] * pos_weights.unsqueeze(0)
+
+        # Regional entropy weighting: upweight information-dense regions
+        if self.config.use_entropy_weighting:
+            entropy_weights = self._compute_entropy_weights(input_ids, labels)
+            frame_weights = frame_weights * entropy_weights
 
         # Per-position cross-entropy
         loss_per_position = F.cross_entropy(
