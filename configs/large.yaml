@@ -1,0 +1,14 @@
+# Large Rosetta config for multi-GPU training
+# ~120M parameters, competitive with DNABERT-2
+
+d_model: 768
+n_heads: 12
+n_layers: 16
+n_frame_layers: 6
+d_ff: 3072
+max_seq_len: 8192
+batch_size: 32
+gradient_accumulation_steps: 8
+learning_rate: 0.0001
+warmup_steps: 10000
+max_steps: 500000

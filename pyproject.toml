@@ -1,0 +1,22 @@
+[project]
+name = "rosetta-genomics"
+version = "0.1.0"
+description = "Rosetta: Multi-Frame RC-Equivariant Genomic Transformer - Finding the Key to DNA's Information Encoding"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+train = [
+    "tensorboard",
+    "wandb",
+]
+bio = [
+    "biopython",
+]
+dev = [
+    "pytest",
+    "ruff",
+]

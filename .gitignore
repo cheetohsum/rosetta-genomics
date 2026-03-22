@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (downloaded genomes can be large)
+data/genomes/
+
+# Claude
+.claude/
+
+# MCP config (local paths)
+.mcp.json
+
+# Model checkpoints (too large for git, train your own)
+checkpoints/*.pt
+
+# Papers (downloaded PDFs)
+papers/*.pdf

@@ -1,0 +1,13 @@
+# Small Rosetta config for local testing / quick iteration
+# ~2M parameters, trains in minutes on CPU
+
+d_model: 128
+n_heads: 4
+n_layers: 4
+n_frame_layers: 2
+d_ff: 512
+max_seq_len: 512
+batch_size: 8
+learning_rate: 0.0003
+warmup_steps: 100
+max_steps: 5000
