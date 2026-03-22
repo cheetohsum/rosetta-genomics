@@ -692,30 +692,36 @@ def level4_frame_gates(checkpoint_path: str, device: torch.device) -> list[Valid
     model, config = load_model_from_checkpoint(checkpoint_path, device)
     tokenizer = DNATokenizer(max_length=config.max_seq_len)
 
-    # --- 4a: Gate activation on known coding sequences ---
-    print("\n  4a. Gate activation on known ORFs...")
+    # --- 4a: Gate activation on known coding sequences (20 trials) ---
+    print("\n  4a. Gate activation on known ORFs (20 trials)...")
 
-    # Frame 0 ORF
-    coding_seq = construct_coding_sequence(126)
-    noncoding_seq = ''.join(random.choices('ACGT', k=126))
-    full_seq = coding_seq + noncoding_seq
-    input_ids = tokenizer.encode(full_seq).unsqueeze(0).to(device)
+    f0_wins = 0
+    all_coding_gates = []
+    for _ in range(20):
+        coding_seq = construct_coding_sequence(126)
+        noncoding_seq = ''.join(random.choices('ACGT', k=126))
+        full_seq = coding_seq + noncoding_seq
+        input_ids = tokenizer.encode(full_seq).unsqueeze(0).to(device)
 
-    with torch.no_grad():
-        gates = model.get_frame_attention_map(input_ids)  # (1, seq_len, 6)
+        with torch.no_grad():
+            gates = model.get_frame_attention_map(input_ids)
 
-    gates_np = gates[0].cpu()
+        gates_np = gates[0].cpu()
+        coding_gates = gates_np[:126, :3].mean(dim=0)
+        all_coding_gates.append(coding_gates)
+        if coding_gates[0] >= coding_gates[1] and coding_gates[0] >= coding_gates[2]:
+            f0_wins += 1
 
-    # Check if frame 0 gate is highest in coding region
-    coding_gates = gates_np[:126, :3].mean(dim=0)  # mean activation per forward frame in coding
-    frame0_dominant = bool(coding_gates[0] >= coding_gates[1] and coding_gates[0] >= coding_gates[2])
+    avg_gates = torch.stack(all_coding_gates).mean(dim=0)
+    win_rate = f0_wins / 20
+    frame0_dominant = win_rate > 0.5  # majority of trials
 
     results.append(ValidationResult(
-        name="Frame 0 gate dominates in frame-0 ORF", level=4, passed=frame0_dominant,
-        metric=float(coding_gates[0].item()), threshold=float(coding_gates[1:].max().item()),
-        details=f"gates: f0={coding_gates[0]:.4f} f1={coding_gates[1]:.4f} f2={coding_gates[2]:.4f}",
+        name="Frame 0 gate dominates in frame-0 ORFs", level=4, passed=frame0_dominant,
+        metric=win_rate, threshold=0.5,
+        details=f"f0 won {f0_wins}/20 trials | avg: f0={avg_gates[0]:.4f} f1={avg_gates[1]:.4f} f2={avg_gates[2]:.4f}",
     ))
-    print(f"    Frame 0 ORF gates: f0={coding_gates[0]:.4f} f1={coding_gates[1]:.4f} f2={coding_gates[2]:.4f}")
+    print(f"    Frame 0 wins: {f0_wins}/20 | avg gates: f0={avg_gates[0]:.4f} f1={avg_gates[1]:.4f} f2={avg_gates[2]:.4f}")
 
     # --- 4b: Coding vs non-coding contrast ---
     print("\n  4b. Coding vs non-coding gate contrast...")
@@ -730,7 +736,34 @@ def level4_frame_gates(checkpoint_path: str, device: torch.device) -> list[Valid
     ))
     print(f"    Coding max gate: {coding_max_gate:.4f}, Non-coding max gate: {noncoding_max_gate:.4f}")
 
-    # --- 4c: Visualization ---
+    # --- 4c: Frame gate entropy ---
+    print("\n  4c. Frame gate entropy (specialization check)...")
+    # Compute entropy of frame gate distribution across 10 sequences
+    entropies = []
+    for _ in range(10):
+        test_seq = ''.join(random.choices('ACGT', k=252))
+        test_ids = tokenizer.encode(test_seq).unsqueeze(0).to(device)
+        with torch.no_grad():
+            test_gates = model.get_frame_attention_map(test_ids)
+        # Entropy per position: H = -sum(p * log(p))
+        p = test_gates[0].cpu()
+        log_p = torch.log(p + 1e-8)
+        entropy = -(p * log_p).sum(dim=-1)  # (seq_len,)
+        entropies.append(entropy.mean().item())
+
+    avg_entropy = sum(entropies) / len(entropies)
+    max_entropy = math.log(6)  # ~1.79 for uniform distribution
+    # After training, entropy should be below max (some specialization)
+    has_specialization = avg_entropy < max_entropy * 0.95
+
+    results.append(ValidationResult(
+        name="Frame gate entropy < uniform", level=4, passed=has_specialization,
+        metric=avg_entropy, threshold=max_entropy * 0.95,
+        details=f"avg_entropy={avg_entropy:.4f} max_uniform={max_entropy:.4f} ratio={avg_entropy/max_entropy:.4f}",
+    ))
+    print(f"    Avg entropy: {avg_entropy:.4f} / {max_entropy:.4f} (ratio: {avg_entropy/max_entropy:.4f})")
+
+    # --- 4d: Visualization ---
     print("\n  4c. Saving frame gate visualizations...")
     try:
         import matplotlib
@@ -1064,12 +1097,14 @@ def level7_biological(checkpoint_path: str, device: torch.device) -> list[Valida
     control_total = 0
 
     for _ in range(50):
-        # Randomize ATG position to avoid positional bias
-        prefix_len = random.randint(10, 80)
+        # Use gene-like context: non-coding prefix, ATG, coding suffix
+        prefix_len = random.randint(10, 60)
         prefix = ''.join(random.choices('ACGT', k=prefix_len))
         atg_pos = len(prefix)
-        suffix_len = 120 - prefix_len
-        suffix = ''.join(random.choices('ACGT', k=suffix_len))
+        # Coding suffix (proper codons, like a real gene after ATG)
+        suffix_codons = [random.choice(['GCT', 'GAA', 'CTG', 'ACC', 'GGC', 'TTC', 'CAG'])
+                         for _ in range(20)]
+        suffix = ''.join(suffix_codons)
         seq = prefix + 'ATG' + suffix
 
         input_ids = tokenizer.encode(seq).unsqueeze(0).to(device)

@@ -211,18 +211,21 @@ class MultiFrameAttention(nn.Module):
         ])
 
         # Cross-frame MLP: lets frame outputs interact before gating
+        # Bottleneck at 2*d_model preserves frame-specific information
+        # while still allowing cross-frame mixing
         self.cross_frame_mlp = nn.Sequential(
-            nn.Linear(config.n_frames * config.d_model, config.d_model),
+            nn.Linear(config.n_frames * config.d_model, config.d_model * 2),
             nn.GELU(),
-            nn.Linear(config.d_model, config.n_frames * config.d_model),
+            nn.Linear(config.d_model * 2, config.n_frames * config.d_model),
         )
 
         # Frame gate: learns which frames are active at each position
-        self.frame_gate = nn.Sequential(
+        # Uses softmax (not sigmoid) to force competition between frames --
+        # if one frame activates, the others must decrease
+        self.frame_gate_proj = nn.Sequential(
             nn.Linear(config.d_model, config.n_frames * config.d_model // 4),
             nn.GELU(),
             nn.Linear(config.n_frames * config.d_model // 4, config.n_frames),
-            nn.Sigmoid()
         )
 
         # Output projection
@@ -281,7 +284,7 @@ class MultiFrameAttention(nn.Module):
 
         # Split back, apply frame gating
         frame_outputs_mixed = mixed.chunk(self.n_frames, dim=-1)
-        gates = self.frame_gate(x)  # (batch, seq_len, n_frames)
+        gates = F.softmax(self.frame_gate_proj(x), dim=-1)  # (batch, seq_len, n_frames)
 
         gated = []
         for frame_idx in range(self.n_frames):
@@ -615,7 +618,7 @@ class RosettaTransformer(nn.Module):
                             gate_layer = self.frame_layers[0].layer
                         else:
                             gate_layer = self.frame_layers[0]
-                        raw_gates = gate_layer.frame_gate(x_for_gate)
+                        raw_gates = F.softmax(gate_layer.frame_gate_proj(x_for_gate), dim=-1)
                         frame_probs = F.softmax(raw_gates[:, :, :3], dim=-1)
 
             loss = self._compute_wobble_aware_loss(logits, labels, input_ids, frame_probs)
@@ -783,7 +786,7 @@ class RosettaTransformer(nn.Module):
         else:
             layer = self.frame_layers[0]
 
-        gates = layer.frame_gate(x)
+        gates = F.softmax(layer.frame_gate_proj(x), dim=-1)
         return gates
 
     def count_parameters(self) -> dict[str, int]:

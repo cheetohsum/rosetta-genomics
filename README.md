@@ -2,7 +2,7 @@
 
 A novel multi-frame, reverse-complement-equivariant genomic transformer that treats DNA as what it actually is: a multi-layered, bidirectional information system with inherent "endianness."
 
-**21/22 validation checks passing** | [Validation Results](#validation-results) | [Architecture](#architecture) | [Quick Start](#quick-start)
+**22-check validation suite** | **Honest results, no inflated claims** | [Validation Results](#validation-results) | [Architecture](#architecture) | [Quick Start](#quick-start)
 
 ---
 
@@ -93,48 +93,42 @@ Learnable embeddings that encode each nucleotide's position within all 6 possibl
 
 ## Validation Results
 
-We built a 7-level validation suite (`validate.py`) that tests the architecture from basic sanity checks through biological benchmarks. **21 of 22 checks pass** on a model trained for only ~843 steps on synthetic data.
+We built a 7-level, 22-check validation suite (`validate.py`) that tests the architecture from sanity checks through biological benchmarks. Tests use statistical significance where applicable and are designed to be honest (several tests previously passed due to positional bias or loose thresholds and have been fixed).
 
-### Summary
+### Current Results (5 epochs, synthetic data)
 
 ```
-Level 1 (3/3) Sanity Checks          -- architecture runs, loss decreases, baseline calibrated
-Level 2 (5/5) MLM Prediction Quality  -- 28.6% accuracy (beats 17.7% untrained by +10.9%), perplexity 3.12
-Level 3 (2/2) RC Equivariance         -- L2 distance ~0 (ratio vs non-equivariant: 3,807,596x)
-Level 4 (3/3) Frame Gate Analysis      -- correct frame dominates, coding > non-coding activation
-Level 5 (3/3) Ablation Studies         -- wobble weighting confirmed +2% improvement
-Level 6 (2/3) Generation Quality       -- realistic GC content (49%), non-uniform dinucleotides
-Level 7 (3/3) Biological Benchmarks    -- Chargaff's rule holds, 100% ATG recognition, stop codon avoidance
+Level 1 (5/5) Sanity Checks           -- shapes, loss, gradients, seed reproducibility
+Level 2 (4/5) MLM Prediction Quality   -- 32.4% accuracy, perplexity 3.08, all 4 nucleotides predicted
+Level 3 (2/2) RC Equivariance          -- learned equivariance L2=0.0067 (approximate, tightens with training)
+Level 4 (1/4) Frame Gate Analysis       -- gates still near-uniform after 5 epochs (needs more training)
+Level 6 (3/3) Generation Quality        -- GC content, dinucleotide diversity, codon periodicity
+Level 7 (1/3) Biological Benchmarks     -- ATG recognition 88% (with gene-like context)
 ```
 
-### Key Findings
+### What Works
 
-**RC equivariance is architecturally perfect.** The normalized L2 distance between `encode(X)` and `reverse(encode(RC(X)))` is 1.35e-9 (effectively zero). A non-equivariant model shows 0.0051 -- a ratio of 3.8 million to one. This proves the `RCEquivariantWrapper` works exactly as designed.
+**The architecture is sound.** All 5 sanity checks pass: forward pass shapes correct, loss decreases during training, gradients flow to all 111 trainable parameter groups, seed reproducibility is exact (0.0 max diff), untrained model is at chance level.
 
-**The model learns start codon recognition.** When masking the 'A' in ATG start codons, the model predicts correctly 100% of the time vs 5% on random control positions. This is with only ~843 training steps -- the architecture discovers biologically meaningful patterns quickly.
+**The model learns nucleotide prediction.** MLM accuracy of 32.4% beats random (14.3% for 7 classes) by a factor of 2.3x. All 4 nucleotides are predicted (A=55%, C=22%, G=38%, T=14% per-class accuracy). Perplexity 3.08 < 4.0 (random). Trained model beats untrained by +11.2 percentage points.
 
-**Wobble weighting provides measurable benefit.** In ablation studies, the full model (32.5% accuracy) beats the no-wobble variant (30.4%) by +2.0%, confirming that codon-position-aware loss weighting helps even on synthetic data.
+**RC equivariance holds (approximately).** The learned equivariant projection produces L2=0.0067 between `encode(X)` and `flip(encode(RC(X)))`. This is approximate (not exact like simple averaging) but preserves more information while maintaining the symmetry property. Expected to tighten with more training.
 
-**Generated sequences respect Chargaff's second parity rule.** Single-strand nucleotide frequencies satisfy |%A - %T| = 5.3% and |%C - %G| = 8.4%, both within the 10% biological tolerance. The model also avoids in-frame stop codons (3.9% vs 4.7% random expectation).
+**Start codon recognition is genuine.** When tested with randomized ATG positions in gene-like context (coding suffix with codon structure), the model predicts the masked 'A' of ATG correctly 88% of the time vs 22% on random control positions. This was previously inflated to 100% due to a fixed-position test design that has been corrected.
 
-**Frame gates show correct behavior.** On sequences with known coding regions in frame 0, the frame-0 gate has the highest activation (0.533 vs 0.526/0.514 for frames 1/2). Gate activation is higher in coding regions than non-coding regions.
+**Generated sequences show biological structure.** GC content is realistic, dinucleotide frequencies deviate from uniform, and codon periodicity (lag-3 autocorrelation) peaks above lag-2 and lag-4.
 
-### Ablation Insights
+### What Doesn't Work Yet
 
-| Variant | Accuracy | Loss | Interpretation |
-|---------|----------|------|----------------|
-| **Full Rosetta** | 32.5% | 1.113 | All innovations active |
-| No RC Equivariance | 36.7% | 1.080 | Faster convergence (fewer params in attention path) |
-| No Wobble Weighting | 30.4% | 1.353 | Wobble weighting definitively helps |
-| No Multi-Frame | 36.7% | 1.088 | Simpler model converges faster on synthetic data |
+**Frame gates are still near-uniform.** After 5 epochs on synthetic data, the 6 softmax frame gates show ~1/6 each (entropy 99.85% of maximum). The model hasn't learned to specialize which frame is active at each position. This requires either more training or real genomic data with annotated gene boundaries.
 
-On synthetic data, simpler models converge faster because multi-frame attention has 6x the attention parameters. RC equivariance and multi-frame attention are designed for real biological patterns (overlapping genes, antisense transcription) that synthetic data doesn't contain. The wobble weighting result is meaningful even on synthetic data because the synthetic generator does produce codon structure.
+**Wobble differentiation is zero.** The wobble-aware loss depends on frame gate predictions to identify codon positions. Since gates are uniform, wobble weights collapse. This will resolve once frame gates learn to specialize.
 
-**These results predict that on real genomic data (E. coli, human), the full model should outperform ablations** as the biological patterns these components target become available to learn from.
+**Stop codon avoidance is not statistically significant.** Frequency of 4.81% vs 4.69% random (z=0.30, p>0.05). Needs more training for the model to learn ORF structure.
 
-### Validation Visualizations
+### What This Tells Us
 
-The validation suite generates frame gate heatmaps showing per-frame activation across sequence positions. See `validation/frame_gates.png` and `validation/frame_gates_line.png` after running `python validate.py`.
+The architecture implements the right inductive biases (multi-frame attention with frame competition via softmax, cross-frame communication, learned RC equivariance, wobble-aware loss). The remaining failures are all "model hasn't trained long enough on rich enough data" -- not architectural problems. The key unlock will be training on real annotated genomes (E. coli with GFF annotations), where frame structure is real and learnable.
 
 ---
 

@@ -67,8 +67,12 @@ def main():
         print(f"Loading FASTA: {args.fasta}")
         dataset = FASTADataset(args.fasta, seq_length=args.seq_length, tokenizer=tokenizer)
     elif args.download_genome:
-        fasta_path = download_sample_genome()
-        dataset = FASTADataset(fasta_path, seq_length=args.seq_length, tokenizer=tokenizer)
+        fasta_path, gff_path = download_sample_genome()
+        print(f"  Frame annotations: {'yes' if gff_path else 'no'}")
+        dataset = FASTADataset(
+            fasta_path, seq_length=args.seq_length, tokenizer=tokenizer,
+            gff_path=gff_path,
+        )
     else:
         print("Using synthetic genomic data")
         dataset = GenomicDataset(
