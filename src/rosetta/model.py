@@ -15,6 +15,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Optional
 
 from .config import RosettaConfig
@@ -177,42 +178,42 @@ class CodonPositionEncoding(nn.Module):
 
 class HierarchicalPositionalEncoding(nn.Module):
     """
-    Multi-scale positional encoding reflecting biological organization:
+    Multi-scale positional encoding reflecting both coding and regulatory organization.
 
-    Scale 0: Nucleotide level (position within sequence)
-    Scale 1: Codon level (position / 3) -- triplet structure
-    Scale 2: Gene scale (position / ~1000) -- gene-level context
-    Scale 3: TAD scale (position / ~100000) -- topological domain context
-
-    Biology teaches us that position matters at EVERY scale:
-    - Telomere proximity silences genes (up to 10Mb)
-    - TAD boundaries define regulatory neighborhoods (~1Mb)
-    - Codon position determines information significance
-    - Single nucleotide position determines reading frame
+    Default 7 scales capture biologically meaningful periodicities:
+      1bp   — nucleotide position (reading frame)
+      2bp   — dinucleotide (CpG patterns, epigenetic signals)
+      3bp   — codon (triplet coding structure)
+      10bp  — helical turn (~10.5bp, TF binding face accessibility)
+      147bp — nucleosome (wrapping periodicity, chromatin structure)
+      1kb   — gene scale (promoter/enhancer distances)
+      100kb — TAD scale (topological domain context)
     """
 
     def __init__(self, config: RosettaConfig):
         super().__init__()
         self.n_scales = config.n_position_scales
         self.scale_factors = config.position_scale_factors
-        d_per_scale = config.d_model // config.n_position_scales
 
-        # Sinusoidal encoding at each scale
-        self.d_per_scale = d_per_scale
-        self.projection = nn.Linear(
-            d_per_scale * config.n_position_scales,
-            config.d_model
-        )
+        # Unequal dim allocation: handles d_model not divisible by n_scales
+        base_d = config.d_model // config.n_position_scales
+        self.dims_per_scale = [base_d] * config.n_position_scales
+        self.dims_per_scale[-1] += config.d_model - base_d * config.n_position_scales
+
+        self.projection = nn.Linear(config.d_model, config.d_model)
 
     def _sinusoidal(self, positions: torch.Tensor, d: int) -> torch.Tensor:
-        """Generate sinusoidal positional encoding."""
+        """Generate sinusoidal positional encoding (handles odd dimensions)."""
         pe = torch.zeros(positions.shape[0], d, device=positions.device)
+        n_sin = (d + 1) // 2  # ceil(d/2) sin terms
+        n_cos = d // 2        # floor(d/2) cos terms
         div_term = torch.exp(
             torch.arange(0, d, 2, device=positions.device).float()
-            * (-math.log(10000.0) / d)
+            * (-math.log(10000.0) / max(d, 1))
         )
-        pe[:, 0::2] = torch.sin(positions.unsqueeze(1).float() * div_term)
-        pe[:, 1::2] = torch.cos(positions.unsqueeze(1).float() * div_term)
+        pe[:, 0::2] = torch.sin(positions.unsqueeze(1).float() * div_term[:n_sin])
+        if n_cos > 0:
+            pe[:, 1::2] = torch.cos(positions.unsqueeze(1).float() * div_term[:n_cos])
         return pe
 
     def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -224,9 +225,9 @@ class HierarchicalPositionalEncoding(nn.Module):
         positions = torch.arange(seq_len, device=device)
 
         scale_encodings = []
-        for scale_factor in self.scale_factors:
+        for i, scale_factor in enumerate(self.scale_factors):
             scaled_pos = positions // scale_factor
-            pe = self._sinusoidal(scaled_pos, self.d_per_scale)
+            pe = self._sinusoidal(scaled_pos, self.dims_per_scale[i])
             scale_encodings.append(pe)
 
         combined = torch.cat(scale_encodings, dim=-1)
@@ -323,24 +324,34 @@ class MultiFrameAttention(nn.Module):
         v_shared = v_shared.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
 
         # Per-frame queries -- each frame asks different questions of the shared K/V
+        # Uses Flash Attention (scaled_dot_product_attention) which:
+        #   - Never materializes the full (seq x seq) attention matrix
+        #   - Runs in O(seq) memory instead of O(seq^2)
+        #   - Uses fused CUDA kernels for ~2x speed
+
+        # Convert mask to SDPA format
+        attn_mask = None
+        if mask is not None:
+            if mask.dim() == 2:
+                if mask.shape[0] == mask.shape[1]:
+                    # Causal mask (seq_len, seq_len) -> (1, 1, seq_len, seq_len)
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0).bool()
+                else:
+                    # Padding mask (batch, seq_len) -> (batch, 1, 1, seq_len)
+                    attn_mask = mask.unsqueeze(1).unsqueeze(2).bool()
+            else:
+                attn_mask = mask.bool()
+
         frame_outputs = []
         for frame_idx in range(self.n_frames):
             q = self.frame_q[frame_idx](x)
             q = q.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
 
-            scale = math.sqrt(self.d_head)
-            attn = torch.matmul(q, k_shared.transpose(-2, -1)) / scale
-
-            if mask is not None:
-                if mask.dim() == 2:
-                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
-                else:
-                    attn = attn.masked_fill(mask == 0, float('-inf'))
-
-            attn = F.softmax(attn, dim=-1)
-            attn = self.dropout(attn)
-
-            out = torch.matmul(attn, v_shared)
+            out = F.scaled_dot_product_attention(
+                q, k_shared, v_shared,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
             out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
             frame_outputs.append(out)
 
@@ -356,6 +367,111 @@ class MultiFrameAttention(nn.Module):
         for frame_idx in range(self.n_frames):
             gate = gates[:, :, frame_idx:frame_idx+1]
             gated.append(frame_outputs_mixed[frame_idx] * gate)
+
+        combined = sum(gated)
+        combined = self.out_proj(combined)
+        combined = self.dropout(combined)
+
+        return self.layer_norm(residual + combined)
+
+
+# =============================================================================
+# Multi-Scale Regulatory Attention
+# =============================================================================
+
+class MultiScaleAttention(nn.Module):
+    """
+    Attention mechanism that processes multiple regulatory scales simultaneously.
+
+    Mirrors MultiFrameAttention but for regulatory rather than coding structure:
+    - Motif scale: learns TF binding motifs (~10bp patterns)
+    - Nucleosome scale: learns nucleosome positioning signals (~150bp)
+    - Enhancer scale: learns regulatory element structure (~500bp)
+
+    Architecture (same pattern as MultiFrameAttention):
+    - Shared K/V projection
+    - Per-scale Q projections (each scale "asks" different questions)
+    - Cross-scale MLP interaction with learned residual scale
+    - Softmax gating (competitive: which scale is dominant at each position)
+    """
+
+    def __init__(self, config: RosettaConfig):
+        super().__init__()
+        self.n_scales = config.n_regulatory_scales
+        self.n_heads = config.n_heads
+        self.d_model = config.d_model
+        self.d_head = config.d_model // config.n_heads
+
+        self.shared_kv = nn.Linear(config.d_model, 2 * config.d_model)
+
+        self.scale_q = nn.ModuleList([
+            nn.Linear(config.d_model, config.d_model)
+            for _ in range(self.n_scales)
+        ])
+
+        self.cross_scale_mlp = nn.Sequential(
+            nn.Linear(self.n_scales * config.d_model, config.d_model * 2),
+            nn.GELU(),
+            nn.Linear(config.d_model * 2, self.n_scales * config.d_model),
+        )
+        self.cross_scale_scale = nn.Parameter(torch.tensor(0.1))
+
+        self.scale_gate_proj = nn.Sequential(
+            nn.Linear(config.d_model, self.n_scales * config.d_model // 4),
+            nn.GELU(),
+            nn.Linear(self.n_scales * config.d_model // 4, self.n_scales),
+        )
+
+        self.out_proj = nn.Linear(config.d_model, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layer_norm = nn.LayerNorm(config.d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch, seq_len, d_model = x.shape
+        residual = x
+
+        kv = self.shared_kv(x)
+        k_shared, v_shared = kv.chunk(2, dim=-1)
+        k_shared = k_shared.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        v_shared = v_shared.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+
+        attn_mask = None
+        if mask is not None:
+            if mask.dim() == 2:
+                if mask.shape[0] == mask.shape[1]:
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0).bool()
+                else:
+                    attn_mask = mask.unsqueeze(1).unsqueeze(2).bool()
+            else:
+                attn_mask = mask.bool()
+
+        scale_outputs = []
+        for scale_idx in range(self.n_scales):
+            q = self.scale_q[scale_idx](x)
+            q = q.view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+
+            out = F.scaled_dot_product_attention(
+                q, k_shared, v_shared,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+            out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
+            scale_outputs.append(out)
+
+        stacked = torch.cat(scale_outputs, dim=-1)
+        mixed = stacked + self.cross_scale_scale * self.cross_scale_mlp(stacked)
+
+        scale_outputs_mixed = mixed.chunk(self.n_scales, dim=-1)
+        gates = F.softmax(self.scale_gate_proj(x), dim=-1)
+
+        gated = []
+        for scale_idx in range(self.n_scales):
+            gate = gates[:, :, scale_idx:scale_idx + 1]
+            gated.append(scale_outputs_mixed[scale_idx] * gate)
 
         combined = sum(gated)
         combined = self.out_proj(combined)
@@ -507,12 +623,13 @@ class RosettaTransformer(nn.Module):
 
         # --- Embedding layers ---
         self.nucleotide_embed = nn.Embedding(config.vocab_size, config.d_model)
+        self.dinucleotide_embed = nn.Embedding(17, config.d_model)  # 16 pairs + 1 special
         self.codon_pos_encoding = CodonPositionEncoding(config)
         self.hierarchical_pos = HierarchicalPositionalEncoding(config)
         self.embed_dropout = nn.Dropout(config.dropout)
         self.embed_norm = nn.LayerNorm(config.d_model)
 
-        # --- Multi-Frame Attention layers (first N layers) ---
+        # --- Multi-Frame Attention layers (coding structure) ---
         self.frame_layers = nn.ModuleList()
         for _ in range(config.n_frame_layers):
             frame_attn = MultiFrameAttention(config)
@@ -521,8 +638,21 @@ class RosettaTransformer(nn.Module):
             else:
                 self.frame_layers.append(frame_attn)
 
-        # --- Standard Transformer layers (remaining layers) ---
-        n_standard = config.n_layers - config.n_frame_layers
+        # --- Multi-Scale Attention layers (regulatory structure) ---
+        assert config.n_frame_layers + config.n_scale_layers <= config.n_layers, (
+            f"frame_layers ({config.n_frame_layers}) + scale_layers ({config.n_scale_layers}) "
+            f"> n_layers ({config.n_layers})"
+        )
+        self.scale_layers = nn.ModuleList()
+        for _ in range(config.n_scale_layers):
+            scale_attn = MultiScaleAttention(config)
+            if config.rc_equivariant:
+                self.scale_layers.append(RCEquivariantWrapper(scale_attn, config.d_model))
+            else:
+                self.scale_layers.append(scale_attn)
+
+        # --- Standard Transformer layers (integration) ---
+        n_standard = config.n_layers - config.n_frame_layers - config.n_scale_layers
         self.standard_layers = nn.ModuleList([
             TransformerLayer(config) for _ in range(n_standard)
         ])
@@ -559,6 +689,15 @@ class RosettaTransformer(nn.Module):
             nn.Linear(config.d_model // 2, config.n_frames),
         )
 
+        # Conservation prediction: per-position evolutionary constraint proxy
+        if config.use_conservation_head:
+            self.conservation_head = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model // 2),
+                nn.GELU(),
+                nn.Linear(config.d_model // 2, 1),
+                nn.Sigmoid(),
+            )
+
         # Generation head (shared with MLM but with causal masking)
         if config.generative:
             self.gen_head = nn.Sequential(
@@ -590,17 +729,27 @@ class RosettaTransformer(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Create rich embeddings combining nucleotide, codon-position, and hierarchical position."""
+        """Create rich embeddings combining nucleotide, dinucleotide, codon-position, and hierarchical position."""
         seq_len = input_ids.shape[1]
         device = input_ids.device
 
         # Character-level nucleotide embedding
         x = self.nucleotide_embed(input_ids)
 
+        # Dinucleotide embedding: overlapping pairs give CpG/epigenetic context
+        if seq_len > 1:
+            left = input_ids[:, :-1]
+            right = input_ids[:, 1:]
+            valid = (left <= 3) & (right <= 3)
+            di_index = left * 4 + right  # 0-15 for valid nucleotide pairs
+            di_index = torch.where(valid, di_index, torch.full_like(di_index, 16))
+            di_index = F.pad(di_index, (0, 1), value=16)  # pad last position
+            x = x + self.dinucleotide_embed(di_index)
+
         # Add codon position encoding (6-frame aware)
         x = x + self.codon_pos_encoding(seq_len, device)
 
-        # Add hierarchical positional encoding (4 scales)
+        # Add hierarchical positional encoding (7 scales: coding + regulatory)
         x = x + self.hierarchical_pos(seq_len, device)
 
         return self.embed_dropout(self.embed_norm(x))
@@ -609,6 +758,25 @@ class RosettaTransformer(nn.Module):
         """Create embeddings for the reverse complement strand."""
         rc_ids = reverse_complement(input_ids)
         return self._embed(rc_ids)
+
+    def _run_rc_layers(self, layers, x_fwd, x_rc, mask, rc_mask, use_ckpt):
+        """Run a list of layers with optional RC equivariance and gradient checkpointing."""
+        for layer in layers:
+            if self.config.rc_equivariant:
+                if use_ckpt:
+                    x_fwd, x_rc = grad_checkpoint(
+                        layer, x_fwd, x_rc, mask, rc_mask, use_reentrant=False,
+                    )
+                else:
+                    x_fwd, x_rc = layer(x_fwd, x_rc, mask=mask, rc_mask=rc_mask)
+            else:
+                if use_ckpt:
+                    x_fwd = grad_checkpoint(layer, x_fwd, mask, use_reentrant=False)
+                    x_rc = grad_checkpoint(layer, x_rc, rc_mask, use_reentrant=False)
+                else:
+                    x_fwd = layer(x_fwd, mask=mask)
+                    x_rc = layer(x_rc, mask=rc_mask)
+        return x_fwd, x_rc
 
     def encode(
         self,
@@ -629,18 +797,23 @@ class RosettaTransformer(nn.Module):
         x_fwd = self._embed(input_ids)
         x_rc = self._create_rc_embeddings(input_ids)
 
-        # Multi-frame attention layers with RC equivariance
         # RC strand positions are reversed, so flip the causal mask
         rc_mask = attention_mask
         if attention_mask is not None and attention_mask.dim() == 2:
             rc_mask = attention_mask.flip(dims=[0, 1])
 
-        for layer in self.frame_layers:
-            if self.config.rc_equivariant:
-                x_fwd, x_rc = layer(x_fwd, x_rc, mask=attention_mask, rc_mask=rc_mask)
-            else:
-                x_fwd = layer(x_fwd, mask=attention_mask)
-                x_rc = layer(x_rc, mask=rc_mask)
+        # Gradient checkpointing: recompute activations during backward pass
+        use_ckpt = self.training and torch.is_grad_enabled()
+
+        # Frame attention layers (coding structure)
+        x_fwd, x_rc = self._run_rc_layers(
+            self.frame_layers, x_fwd, x_rc, attention_mask, rc_mask, use_ckpt
+        )
+
+        # Scale attention layers (regulatory structure)
+        x_fwd, x_rc = self._run_rc_layers(
+            self.scale_layers, x_fwd, x_rc, attention_mask, rc_mask, use_ckpt
+        )
 
         # Strand role asymmetry: apply strand-specific projections (residual)
         if self.config.use_strand_asymmetry:
@@ -650,9 +823,12 @@ class RosettaTransformer(nn.Module):
         # Fuse forward and reverse complement representations
         x = self.strand_fusion(torch.cat([x_fwd, x_rc.flip(dims=[1])], dim=-1))
 
-        # Standard transformer layers for deeper processing
+        # Standard transformer layers for integration
         for layer in self.standard_layers:
-            x = layer(x, mask=attention_mask)
+            if use_ckpt:
+                x = grad_checkpoint(layer, x, attention_mask, use_reentrant=False)
+            else:
+                x = layer(x, mask=attention_mask)
 
         return x
 
@@ -662,6 +838,8 @@ class RosettaTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         frame_labels: Optional[torch.Tensor] = None,
+        conservation_targets: Optional[torch.Tensor] = None,
+        global_step: Optional[int] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass with optional loss computation.
@@ -684,45 +862,77 @@ class RosettaTransformer(nn.Module):
         # Frame prediction
         frame_logits = self.frame_head(hidden)
 
+        # Conservation prediction
+        conservation_pred = None
+        if hasattr(self, 'conservation_head'):
+            conservation_pred = self.conservation_head(hidden).squeeze(-1)  # (batch, seq_len)
+
         output = {
             'logits': logits,
             'frame_logits': frame_logits,
             'hidden_states': hidden,
         }
+        if conservation_pred is not None:
+            output['conservation_pred'] = conservation_pred
 
-        # Compute loss if labels provided
-        if labels is not None:
-            # Get frame probabilities for wobble weighting
-            frame_probs = None
-            if self.config.use_wobble_weighting:
+        # Compute loss in FP32 — wobble weights, entropy, and log() are
+        # numerically unstable in FP16. Disable autocast for this block.
+        with torch.amp.autocast("cuda", enabled=False):
+            logits_f32 = logits.float()
+            frame_logits_f32 = frame_logits.float()
+
+            if labels is not None:
+                # Decide whether to use weighted loss or plain CE
+                in_warmup = (global_step is not None
+                             and self.config.warmup_plain_ce_steps > 0
+                             and global_step < self.config.warmup_plain_ce_steps)
+                use_weighted = self.config.use_wobble_weighting and not in_warmup
+
+                # Detect which samples have CDS annotations (non-zero frame labels)
+                has_cds = None
                 if frame_labels is not None:
-                    # Use ground truth frame labels (forward 3 frames)
-                    fwd_labels = frame_labels[:, :, :3]
-                    label_sum = fwd_labels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                    frame_probs = fwd_labels / label_sum
-                else:
-                    # Use model's own frame gate predictions (detached)
-                    with torch.no_grad():
-                        x_for_gate = self._embed(input_ids)
-                        if self.config.rc_equivariant:
-                            gate_layer = self.frame_layers[0].layer
-                        else:
-                            gate_layer = self.frame_layers[0]
-                        raw_gates = F.softmax(gate_layer.frame_gate_proj(x_for_gate), dim=-1)
-                        # Extract forward 3 frames and renormalize (NOT double softmax)
-                        fwd_gates = raw_gates[:, :, :3]
-                        frame_probs = fwd_gates / fwd_gates.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    has_cds = frame_labels.sum(dim=(1, 2)) > 0  # (batch,)
 
-            loss = self._compute_wobble_aware_loss(logits, labels, input_ids, frame_probs)
-            output['loss'] = loss
+                frame_probs = None
+                if use_weighted:
+                    if frame_labels is not None:
+                        # Use ground truth frame labels (forward 3 frames)
+                        fwd_labels = frame_labels[:, :, :3].float()
+                        label_sum = fwd_labels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                        frame_probs = fwd_labels / label_sum
+                    else:
+                        # Use model's own frame gate predictions (detached)
+                        with torch.no_grad():
+                            x_for_gate = self._embed(input_ids).float()
+                            if self.config.rc_equivariant:
+                                gate_layer = self.frame_layers[0].layer
+                            else:
+                                gate_layer = self.frame_layers[0]
+                            raw_gates = F.softmax(gate_layer.frame_gate_proj(x_for_gate), dim=-1)
+                            fwd_gates = raw_gates[:, :, :3]
+                            frame_probs = fwd_gates / fwd_gates.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        if frame_labels is not None:
-            frame_loss = F.binary_cross_entropy_with_logits(
-                frame_logits, frame_labels.float()
-            )
-            output['frame_loss'] = frame_loss
-            if 'loss' in output:
-                output['loss'] = output['loss'] + 0.1 * frame_loss
+                loss = self._compute_wobble_aware_loss(
+                    logits_f32, labels, input_ids, frame_probs, has_cds=has_cds
+                )
+                output['loss'] = loss
+
+            if frame_labels is not None:
+                frame_loss = F.binary_cross_entropy_with_logits(
+                    frame_logits_f32, frame_labels.float()
+                )
+                output['frame_loss'] = frame_loss
+                if 'loss' in output:
+                    output['loss'] = output['loss'] + 0.1 * frame_loss
+
+            # Conservation prediction loss
+            if conservation_targets is not None and conservation_pred is not None:
+                conservation_loss = F.mse_loss(
+                    conservation_pred.float(), conservation_targets.float()
+                )
+                output['conservation_loss'] = conservation_loss
+                if 'loss' in output:
+                    output['loss'] = output['loss'] + self.config.conservation_weight * conservation_loss
 
         return output
 
@@ -807,13 +1017,13 @@ class RosettaTransformer(nn.Module):
         original[known] = labels[known]
         safe_seq = original.clamp(0, 3)  # clamp special tokens to valid nucleotides
 
-        # One-hot encode: (batch, seq_len, 4)
-        one_hot = F.one_hot(safe_seq.long(), num_classes=4).float()
+        # One-hot encode in FP32 (entropy log() is unstable in FP16)
+        one_hot = F.one_hot(safe_seq.long(), num_classes=4).to(torch.float32)
 
         # Sliding window sum via 1D convolution
         # Reshape to (batch, 4, seq_len) for conv1d
         one_hot_t = one_hot.permute(0, 2, 1)  # (batch, 4, seq_len)
-        kernel = torch.ones(4, 1, window, device=device) / window
+        kernel = torch.ones(4, 1, window, device=device, dtype=torch.float32) / window
         # Grouped conv: each of 4 channels independently
         freqs = F.conv1d(one_hot_t, kernel, padding=half_w, groups=4)  # (batch, 4, seq_len)
 
@@ -837,6 +1047,7 @@ class RosettaTransformer(nn.Module):
         labels: torch.Tensor,
         input_ids: torch.Tensor,
         frame_probs: Optional[torch.Tensor] = None,
+        has_cds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Wobble-aware cross-entropy loss with per-codon degeneracy weighting.
@@ -845,7 +1056,20 @@ class RosettaTransformer(nn.Module):
         from the actual degeneracy of its codon (e.g., Met ATG pos3 = 1.0,
         Ala GCx pos3 = 0.25). Falls back to fixed [1.0, 1.0, 0.5] weights
         when codon context is unavailable.
+
+        has_cds: (batch,) bool tensor indicating which samples have CDS
+        annotations. Samples without CDS get uniform weight=1.0 (plain CE)
+        instead of wobble/entropy weighting — prevents near-zero loss on
+        non-coding windows that caused representation collapse.
+
+        Loss computed in FP32 — entropy log() and weighted reduction
+        are numerically unstable in FP16.
         """
+        # Force FP32 for numerical stability under AMP
+        logits = logits.float()
+        if frame_probs is not None:
+            frame_probs = frame_probs.float()
+
         if not self.config.use_wobble_weighting or frame_probs is None:
             return F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
@@ -872,7 +1096,17 @@ class RosettaTransformer(nn.Module):
         # Regional entropy weighting: upweight information-dense regions
         if self.config.use_entropy_weighting:
             entropy_weights = self._compute_entropy_weights(input_ids, labels)
+            # Only apply entropy weighting on CDS samples
+            if has_cds is not None:
+                no_cds = ~has_cds.unsqueeze(1)  # (batch, 1) for broadcasting
+                entropy_weights = torch.where(no_cds, torch.ones_like(entropy_weights), entropy_weights)
             frame_weights = frame_weights * entropy_weights
+
+        # Non-CDS samples get uniform weight (plain CE) — prevents near-zero
+        # loss on non-coding windows that caused representation collapse
+        if has_cds is not None:
+            no_cds = ~has_cds.unsqueeze(1)  # (batch, 1)
+            frame_weights = torch.where(no_cds, torch.ones_like(frame_weights), frame_weights)
 
         # Per-position cross-entropy
         loss_per_position = F.cross_entropy(
@@ -990,6 +1224,9 @@ class RosettaTransformer(nn.Module):
         counts['embedding'] = sum(
             p.numel() for p in self.nucleotide_embed.parameters()
         )
+        counts['dinucleotide'] = sum(
+            p.numel() for p in self.dinucleotide_embed.parameters()
+        )
         counts['codon_position'] = sum(
             p.numel() for p in self.codon_pos_encoding.parameters()
         )
@@ -999,6 +1236,9 @@ class RosettaTransformer(nn.Module):
         counts['frame_attention'] = sum(
             p.numel() for p in self.frame_layers.parameters()
         )
+        counts['scale_attention'] = sum(
+            p.numel() for p in self.scale_layers.parameters()
+        )
         counts['standard_layers'] = sum(
             p.numel() for p in self.standard_layers.parameters()
         )
@@ -1006,5 +1246,9 @@ class RosettaTransformer(nn.Module):
             p.numel() for n, p in self.named_parameters()
             if 'mlm_head' in n or 'frame_head' in n or 'gen_head' in n
         )
+        if hasattr(self, 'conservation_head'):
+            counts['conservation_head'] = sum(
+                p.numel() for p in self.conservation_head.parameters()
+            )
         counts['total'] = sum(p.numel() for p in self.parameters())
         return counts

@@ -19,13 +19,17 @@ class RosettaConfig:
     d_model: int = 512
     max_seq_len: int = 8192  # nucleotides (not tokens -- character-level)
 
-    # --- Multi-Frame Attention ---
+    # --- Multi-Frame Attention (coding structure) ---
     n_frames: int = 6          # 3 forward + 3 reverse complement reading frames
     n_heads: int = 8           # attention heads per frame-aware layer
     n_layers: int = 12         # total transformer layers
     n_frame_layers: int = 4    # layers with explicit multi-frame attention (first N)
     d_ff: int = 2048           # feedforward dimension
     dropout: float = 0.1
+
+    # --- Multi-Scale Attention (regulatory structure) ---
+    n_regulatory_scales: int = 3  # motif (~10bp), nucleosome (~150bp), enhancer (~500bp)
+    n_scale_layers: int = 2       # layers with multi-scale attention (after frame layers)
 
     # --- RC Equivariance ---
     rc_equivariant: bool = True  # enforce reverse-complement equivariance
@@ -35,9 +39,14 @@ class RosettaConfig:
     use_wobble_weighting: bool = True  # weight loss by codon position significance
 
     # --- Hierarchical Positional Encoding ---
+    # Multi-resolution encoding reflecting both coding and regulatory organization:
+    # 1bp (nucleotide), 2bp (dinucleotide/CpG), 3bp (codon), 10bp (helical turn),
+    # 147bp (nucleosome), 1000bp (gene), 100000bp (TAD)
     positional_encoding: Literal["hierarchical", "alibi", "sinusoidal"] = "hierarchical"
-    n_position_scales: int = 4  # nucleotide, codon, gene-scale (~1kb), TAD-scale (~100kb)
-    position_scale_factors: list[int] = field(default_factory=lambda: [1, 3, 1000, 100000])
+    n_position_scales: int = 7
+    position_scale_factors: list[int] = field(
+        default_factory=lambda: [1, 2, 3, 10, 147, 1000, 100000]
+    )
 
     # --- Generation ---
     generative: bool = True  # include autoregressive generation head
@@ -52,6 +61,9 @@ class RosettaConfig:
     max_steps: int = 500000
     batch_size: int = 32
     gradient_accumulation_steps: int = 4
+    use_amp: bool = False        # automatic mixed precision (FP16)
+    num_workers: int = 0         # DataLoader worker processes
+    warmup_plain_ce_steps: int = 0  # steps using plain CE before wobble/entropy kicks in
 
     # --- Wobble-Aware Loss ---
     # Information significance per codon position:
@@ -67,6 +79,11 @@ class RosettaConfig:
     use_entropy_weighting: bool = True
     entropy_window: int = 31         # local window for entropy computation (odd number)
     entropy_min_weight: float = 0.3  # floor to avoid suppressing any region to zero
+
+    # --- Conservation Prediction ---
+    # Auxiliary task: predict per-position evolutionary conservation from local entropy
+    use_conservation_head: bool = True
+    conservation_weight: float = 0.05   # loss weight (small — auxiliary to MLM)
 
     # --- Strand Role Asymmetry ---
     # Allow learned differences between template and coding strands
