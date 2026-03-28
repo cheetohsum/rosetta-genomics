@@ -34,6 +34,10 @@ class RosettaConfig:
     # --- RC Equivariance ---
     rc_equivariant: bool = True  # enforce reverse-complement equivariance
 
+    # --- Mixture-of-Depths Attention (MoDA) ---
+    use_moda: bool = True         # cross-layer K/V access in standard layers
+    moda_depth: int = 3           # attend to this many preceding layers (0 = all)
+
     # --- Codon Position Encoding ---
     codon_position_dim: int = 32   # dimension for codon-position embeddings (pos 1, 2, 3)
     use_wobble_weighting: bool = True  # weight loss by codon position significance
@@ -79,6 +83,30 @@ class RosettaConfig:
     use_entropy_weighting: bool = True
     entropy_window: int = 31         # local window for entropy computation (odd number)
     entropy_min_weight: float = 0.3  # floor to avoid suppressing any region to zero
+
+    # --- ELECTRA (Replaced Token Detection) ---
+    use_electra: bool = False             # False=MLM, True=ELECTRA RTD (6.7x more signal)
+    electra_gen_layers: int = 2           # generator depth
+    electra_gen_d_model: int = 128        # generator hidden dim
+    electra_gen_n_heads: int = 4
+    electra_gen_d_ff: int = 512
+    electra_gen_weight: float = 50.0      # generator loss multiplier
+    electra_mask_prob: float = 0.15       # fraction of positions masked for generator
+
+    # --- Contrastive / Anti-Collapse ---
+    contrastive_weight: float = 0.01    # embedding uniformity regularization
+
+    # --- Codon-Aware Masking ---
+    codon_mask_fraction: float = 0.5    # fraction of mask budget using codon-aligned masking
+    # TODO: Curriculum task difficulty (DNABERT-S insight) — ramp codon_mask_fraction
+    # from 0 (easy, individual masking) to 0.5+ (hard, codon masking) over training.
+    # Currently static. Implement via global_step check in _create_codon_aware_mask.
+
+    # --- JEPA (Latent Span Prediction) --- EXPERIMENTAL
+    # Predicts hidden states at masked positions from original encoding.
+    # Adds a second (no-grad) forward pass — ~40% more compute.
+    use_jepa: bool = False
+    jepa_weight: float = 0.1
 
     # --- Conservation Prediction ---
     # Auxiliary task: predict per-position evolutionary conservation from local entropy

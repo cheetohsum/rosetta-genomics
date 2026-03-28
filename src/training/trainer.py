@@ -210,15 +210,24 @@ class RosettaTrainer:
                         flush=True,
                     )
 
-                    # Prediction distribution: catch "predict A for everything" collapse
+                    # Monitoring: prediction distribution (MLM) or RTD accuracy (ELECTRA)
                     with torch.no_grad():
-                        preds = outputs['logits'].argmax(dim=-1)
-                        pred_mask = (labels != -100)
-                        if pred_mask.any():
-                            pred_dist = torch.bincount(preds[pred_mask].view(-1).clamp(0, 3), minlength=4)[:4]
-                            pred_pct = pred_dist.float() / pred_dist.sum().clamp(min=1) * 100
-                            print(f"    Pred dist: A:{pred_pct[0]:.0f}% C:{pred_pct[1]:.0f}% "
-                                  f"G:{pred_pct[2]:.0f}% T:{pred_pct[3]:.0f}%", flush=True)
+                        if 'rtd_logits' in outputs:
+                            # ELECTRA mode
+                            rtd_preds = (outputs['rtd_logits'].sigmoid() > 0.5).float()
+                            rtd_acc = (rtd_preds == outputs['rtd_labels']).float().mean() * 100
+                            replaced_frac = outputs['rtd_labels'].mean() * 100
+                            print(f"    RTD acc: {rtd_acc:.1f}% | replaced: {replaced_frac:.1f}% | "
+                                  f"disc: {outputs['disc_loss'].item():.4f} | "
+                                  f"gen: {outputs['gen_loss'].item():.4f}", flush=True)
+                        else:
+                            preds = outputs['logits'].argmax(dim=-1)
+                            pred_mask = (labels != -100)
+                            if pred_mask.any():
+                                pred_dist = torch.bincount(preds[pred_mask].view(-1).clamp(0, 3), minlength=4)[:4]
+                                pred_pct = pred_dist.float() / pred_dist.sum().clamp(min=1) * 100
+                                print(f"    Pred dist: A:{pred_pct[0]:.0f}% C:{pred_pct[1]:.0f}% "
+                                      f"G:{pred_pct[2]:.0f}% T:{pred_pct[3]:.0f}%", flush=True)
 
             # Epoch summary
             avg_loss = epoch_loss / max(epoch_steps, 1)

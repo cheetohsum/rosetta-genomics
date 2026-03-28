@@ -541,16 +541,25 @@ class RCEquivariantWrapper(nn.Module):
 # =============================================================================
 
 class TransformerLayer(nn.Module):
-    """Standard transformer layer with pre-norm."""
+    """Standard transformer layer with pre-norm and optional MoDA (cross-layer K/V access).
+
+    When depth_kv is provided, queries attend over [depth_K/V | current_K/V],
+    letting this layer directly access features from preceding layers without
+    signal dilution through the residual stream.
+    """
 
     def __init__(self, config: RosettaConfig):
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            config.d_model,
-            config.n_heads,
-            dropout=config.dropout,
-            batch_first=True
-        )
+        self.n_heads = config.n_heads
+        self.d_head = config.d_model // config.n_heads
+
+        # Explicit Q/K/V projections (replaces nn.MultiheadAttention for MoDA support)
+        self.q_proj = nn.Linear(config.d_model, config.d_model)
+        self.k_proj = nn.Linear(config.d_model, config.d_model)
+        self.v_proj = nn.Linear(config.d_model, config.d_model)
+        self.out_proj = nn.Linear(config.d_model, config.d_model)
+        self.attn_dropout = nn.Dropout(config.dropout)
+
         self.ff = nn.Sequential(
             nn.Linear(config.d_model, config.d_ff),
             nn.GELU(),
@@ -564,25 +573,136 @@ class TransformerLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        # Pre-norm attention
+        mask: Optional[torch.Tensor] = None,
+        depth_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            mask: optional attention mask
+            depth_kv: optional (depth_K, depth_V) from preceding layers,
+                      each (batch, n_heads, depth_len, d_head)
+        Returns:
+            (x, K, V) — hidden state + this layer's K/V for MoDA cache
+        """
+        batch, seq_len, _ = x.shape
         normed = self.norm1(x)
 
-        # Convert mask from "1=attend, 0=block" to additive float mask
-        # that nn.MultiheadAttention expects (0=attend, -inf=block)
+        # Q/K/V projections
+        q = self.q_proj(normed).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(normed).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(normed).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+
+        # MoDA: prepend depth K/V from preceding layers
+        if depth_kv is not None:
+            depth_k, depth_v = depth_kv
+            k_all = torch.cat([depth_k, k], dim=2)
+            v_all = torch.cat([depth_v, v], dim=2)
+        else:
+            k_all, v_all = k, v
+
+        # Build mask for SDPA — depth tokens are always attendable
         attn_mask = None
         if mask is not None:
-            attn_mask = torch.zeros_like(mask, dtype=torch.float)
-            attn_mask = attn_mask.masked_fill(mask == 0, float('-inf'))
+            if mask.dim() == 2 and mask.shape[0] == mask.shape[1]:
+                # Causal mask — extend for depth tokens (all attendable)
+                depth_len = k_all.shape[2] - seq_len
+                if depth_len > 0:
+                    depth_mask = torch.ones(seq_len, depth_len, device=mask.device)
+                    attn_mask = torch.cat([depth_mask, mask], dim=1).unsqueeze(0).unsqueeze(0).bool()
+                else:
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0).bool()
+            elif mask.dim() == 2:
+                # Padding mask (batch, seq) — depth tokens always valid
+                depth_len = k_all.shape[2] - seq_len
+                if depth_len > 0:
+                    depth_pad = torch.ones(batch, depth_len, device=mask.device)
+                    full_mask = torch.cat([depth_pad, mask], dim=1)
+                    attn_mask = full_mask.unsqueeze(1).unsqueeze(2).bool()
+                else:
+                    attn_mask = mask.unsqueeze(1).unsqueeze(2).bool()
+            else:
+                attn_mask = mask.bool()
 
-        attn_out, _ = self.attn(normed, normed, normed, attn_mask=attn_mask)
+        attn_out = F.scaled_dot_product_attention(
+            q, k_all, v_all,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+        )
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        attn_out = self.out_proj(attn_out)
         x = x + attn_out
 
         # Pre-norm feedforward
         normed = self.norm2(x)
         x = x + self.ff(normed)
+
+        return x, k, v
+
+
+# =============================================================================
+# ELECTRA Generator (lightweight, disposable after pretraining)
+# =============================================================================
+
+class _GeneratorLayer(nn.Module):
+    """Minimal transformer layer for the ELECTRA generator."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model), nn.Dropout(dropout),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        normed = self.norm1(x)
+        q = self.q_proj(normed).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(normed).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(normed).view(batch, seq_len, self.n_heads, self.d_head).transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        x = x + self.out_proj(attn_out)
+        x = x + self.ff(self.norm2(x))
         return x
+
+
+class ElectraGenerator(nn.Module):
+    """Small generator for ELECTRA pretraining. Predicts replacements at masked positions."""
+
+    def __init__(self, config: RosettaConfig, shared_embed: nn.Embedding):
+        super().__init__()
+        gd = config.electra_gen_d_model
+        self.shared_embed = shared_embed  # reference to discriminator's embedding
+        self.embed_proj = nn.Linear(config.d_model, gd)
+        self.layers = nn.ModuleList([
+            _GeneratorLayer(gd, config.electra_gen_n_heads, config.electra_gen_d_ff, config.dropout)
+            for _ in range(config.electra_gen_layers)
+        ])
+        self.mlm_head = nn.Sequential(
+            nn.Linear(gd, gd), nn.GELU(), nn.LayerNorm(gd),
+            nn.Linear(gd, config.vocab_size),
+        )
+
+    def forward(self, masked_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            masked_ids: (batch, seq_len) with [MASK]=6 at masked positions
+        Returns:
+            logits: (batch, seq_len, vocab_size) predictions at all positions
+        """
+        x = self.embed_proj(self.shared_embed(masked_ids))
+        for layer in self.layers:
+            x = layer(x)
+        return self.mlm_head(x)
 
 
 # =============================================================================
@@ -707,6 +827,23 @@ class RosettaTransformer(nn.Module):
                 nn.Linear(config.d_model, 4),  # A, C, G, T only
             )
 
+        # JEPA: latent span prediction head (experimental)
+        if config.use_jepa:
+            self.jepa_head = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+
+        # ELECTRA: generator + replaced-token detection head
+        if config.use_electra:
+            self.generator = ElectraGenerator(config, self.nucleotide_embed)
+            self.rtd_head = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1),
+            )
+
         self._init_weights()
 
         # Per-codon degeneracy weight table (static, rebuilt on construction)
@@ -823,14 +960,246 @@ class RosettaTransformer(nn.Module):
         # Fuse forward and reverse complement representations
         x = self.strand_fusion(torch.cat([x_fwd, x_rc.flip(dims=[1])], dim=-1))
 
-        # Standard transformer layers for integration
+        # Standard transformer layers for integration (with optional MoDA)
+        depth_cache = []
         for layer in self.standard_layers:
+            # Build depth K/V from preceding standard layers
+            depth_kv = None
+            if depth_cache and self.config.use_moda:
+                max_d = self.config.moda_depth
+                recent = depth_cache[-max_d:] if max_d > 0 else depth_cache
+                depth_kv = (
+                    torch.cat([kv[0] for kv in recent], dim=2),
+                    torch.cat([kv[1] for kv in recent], dim=2),
+                )
+
             if use_ckpt:
-                x = grad_checkpoint(layer, x, attention_mask, use_reentrant=False)
+                x, k, v = grad_checkpoint(
+                    layer, x, attention_mask, depth_kv, use_reentrant=False,
+                )
             else:
-                x = layer(x, mask=attention_mask)
+                x, k, v = layer(x, mask=attention_mask, depth_kv=depth_kv)
+
+            # Cache K/V for subsequent layers (detached to prevent graph explosion)
+            if self.config.use_moda:
+                depth_cache.append((k.detach(), v.detach()))
 
         return x
+
+    def _create_codon_aware_mask(
+        self,
+        original_ids: torch.Tensor,
+        frame_labels: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Create mask with mix of individual and codon-aligned masking (Pairwise MLM insight).
+
+        Codon masking forces the model to learn codon-level correlations:
+        positions 1-2 constrain position 3 (wobble), but when all 3 are masked,
+        the model must use broader context to predict the entire codon.
+        """
+        batch_size, seq_len = original_ids.shape
+        device = original_ids.device
+        mask_prob = self.config.electra_mask_prob
+        codon_frac = self.config.codon_mask_fraction
+
+        special = (original_ids >= 4)
+        masked_positions = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+
+        # Budget split: codon_frac goes to codon masking, rest to individual
+        codon_budget = mask_prob * codon_frac
+        indiv_budget = mask_prob * (1 - codon_frac)
+
+        # Individual masking
+        indiv_prob = torch.full((batch_size, seq_len), indiv_budget, device=device)
+        indiv_prob.masked_fill_(special, 0.0)
+        masked_positions |= torch.bernoulli(indiv_prob).bool()
+
+        # Codon masking: mask groups of 3 aligned to position % 3
+        # Use frame_labels to find the dominant reading frame, fallback to frame 0
+        codon_starts = torch.arange(0, seq_len - 2, 3, device=device)  # frame 0 alignment
+        n_codons = len(codon_starts)
+        if n_codons > 0:
+            codon_mask_prob = torch.full((batch_size, n_codons), codon_budget * 3, device=device)
+            codon_selected = torch.bernoulli(codon_mask_prob).bool()
+            for i, start in enumerate(codon_starts):
+                for offset in range(3):
+                    pos = start + offset
+                    if pos < seq_len:
+                        masked_positions[:, pos] |= codon_selected[:, i] & ~special[:, pos]
+
+        return masked_positions
+
+    def _forward_electra(
+        self,
+        original_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        frame_labels: Optional[torch.Tensor],
+        conservation_targets: Optional[torch.Tensor],
+        global_step: Optional[int],
+    ) -> dict[str, torch.Tensor]:
+        """ELECTRA forward with codon-aware masking, uniformity loss, and optional JEPA."""
+        batch_size, seq_len = original_ids.shape
+        device = original_ids.device
+
+        # Step 1: Codon-aware masking (pairwise MLM insight)
+        masked_positions = self._create_codon_aware_mask(original_ids, frame_labels)
+
+        # Step 2: Mask input for generator
+        masked_ids = original_ids.clone()
+        masked_ids[masked_positions] = 6  # [MASK]
+
+        # Step 3: Generator predicts replacements
+        gen_logits = self.generator(masked_ids)
+
+        # Step 4: Sample replacements
+        with torch.no_grad():
+            in_warmup = (global_step is not None
+                         and self.config.warmup_plain_ce_steps > 0
+                         and global_step < self.config.warmup_plain_ce_steps)
+            n_masked = masked_positions.sum()
+            if in_warmup or n_masked == 0:
+                sampled = torch.randint(0, 4, (max(n_masked, 1),), device=device)
+            else:
+                gen_probs = F.softmax(gen_logits[masked_positions], dim=-1)
+                sampled = torch.multinomial(gen_probs, 1).squeeze(-1)
+
+        # Step 5: Build corrupted sequence
+        corrupted_ids = original_ids.clone()
+        if n_masked > 0:
+            corrupted_ids[masked_positions] = sampled[:n_masked]
+
+        # Step 6: RTD labels — 0=real, 1=replaced (correct guesses → "real")
+        rtd_labels = (corrupted_ids != original_ids).float()
+
+        # Step 7: Run discriminator on corrupted sequence
+        hidden = self.encode(corrupted_ids, attention_mask)
+
+        # Step 8: Predictions
+        rtd_logits = self.rtd_head(hidden).squeeze(-1)
+        frame_logits = self.frame_head(hidden)
+
+        conservation_pred = None
+        if hasattr(self, 'conservation_head'):
+            conservation_pred = self.conservation_head(hidden).squeeze(-1)
+
+        # Step 9: Losses (in FP32)
+        with torch.amp.autocast("cuda", enabled=False):
+            # Generator loss
+            gen_loss = torch.tensor(0.0, device=device)
+            if n_masked > 0:
+                gen_loss = F.cross_entropy(
+                    gen_logits[masked_positions].float(),
+                    original_ids[masked_positions],
+                )
+
+            # Discriminator RTD loss
+            has_cds = None
+            if frame_labels is not None:
+                has_cds = frame_labels.sum(dim=(1, 2)) > 0
+
+            disc_loss = self._compute_rtd_loss(
+                rtd_logits.float(), rtd_labels, original_ids,
+                frame_labels, has_cds, global_step,
+            )
+
+            total_loss = disc_loss + self.config.electra_gen_weight * gen_loss
+
+            # Embedding uniformity loss (anti-collapse contrastive)
+            if self.config.contrastive_weight > 0 and batch_size > 1:
+                embs = F.normalize(hidden.mean(dim=1).float(), dim=1)  # (batch, d_model)
+                sim_matrix = embs @ embs.T
+                off_diag = sim_matrix[~torch.eye(batch_size, dtype=torch.bool, device=device)]
+                uniformity_loss = off_diag.mean()
+                total_loss = total_loss + self.config.contrastive_weight * uniformity_loss
+
+            # JEPA: predict original hidden states at masked positions (EXPERIMENTAL)
+            # Requires a second no-grad forward pass on original_ids
+            if self.config.use_jepa and hasattr(self, 'jepa_head') and n_masked > 0:
+                with torch.no_grad():
+                    target_hidden = self.encode(original_ids, attention_mask)
+                jepa_pred = self.jepa_head(hidden[masked_positions].float())
+                jepa_target = target_hidden[masked_positions].float().detach()
+                jepa_loss = F.mse_loss(jepa_pred, jepa_target)
+                total_loss = total_loss + self.config.jepa_weight * jepa_loss
+
+            # Auxiliary losses
+            if frame_labels is not None:
+                frame_loss = F.binary_cross_entropy_with_logits(
+                    frame_logits.float(), frame_labels.float()
+                )
+                total_loss = total_loss + 0.1 * frame_loss
+
+            if conservation_targets is not None and conservation_pred is not None:
+                conservation_loss = F.mse_loss(
+                    conservation_pred.float(), conservation_targets.float()
+                )
+                total_loss = total_loss + self.config.conservation_weight * conservation_loss
+
+        return {
+            'loss': total_loss,
+            'disc_loss': disc_loss,
+            'gen_loss': gen_loss,
+            'rtd_logits': rtd_logits,
+            'rtd_labels': rtd_labels,
+            'logits': gen_logits,  # for compatibility (trainer logging)
+            'frame_logits': frame_logits,
+            'hidden_states': hidden,
+        }
+
+    def _compute_rtd_loss(
+        self,
+        rtd_logits: torch.Tensor,
+        rtd_labels: torch.Tensor,
+        original_ids: torch.Tensor,
+        frame_labels: Optional[torch.Tensor],
+        has_cds: Optional[torch.Tensor],
+        global_step: Optional[int],
+    ) -> torch.Tensor:
+        """Wobble-aware binary CE for replaced-token detection."""
+        in_warmup = (global_step is not None
+                     and self.config.warmup_plain_ce_steps > 0
+                     and global_step < self.config.warmup_plain_ce_steps)
+
+        if not self.config.use_wobble_weighting or in_warmup or frame_labels is None:
+            return F.binary_cross_entropy_with_logits(rtd_logits, rtd_labels)
+
+        batch_size, seq_len = rtd_logits.shape
+
+        # Wobble weights from codon position (same logic, simpler since we have original_ids)
+        fwd_labels = frame_labels[:, :, :3].float()
+        label_sum = fwd_labels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        frame_probs = fwd_labels / label_sum
+
+        if self.config.use_codon_weights and hasattr(self, 'codon_weight_table'):
+            # Create dummy labels for _compute_codon_frame_weights (no -100 masking needed)
+            dummy_labels = original_ids.clone()
+            frame_weights = self._compute_codon_frame_weights(
+                original_ids, dummy_labels, frame_probs, batch_size, seq_len
+            )
+        else:
+            w = torch.tensor(self.config.wobble_weights, device=rtd_logits.device)
+            positions = torch.arange(seq_len, device=rtd_logits.device)
+            frame_weights = torch.zeros(batch_size, seq_len, device=rtd_logits.device)
+            for f in range(3):
+                codon_pos = (positions - f) % 3
+                frame_weights += frame_probs[:, :, f] * w[codon_pos].unsqueeze(0)
+
+        # Non-CDS samples get uniform weight
+        if has_cds is not None:
+            no_cds = ~has_cds.unsqueeze(1)
+            frame_weights = torch.where(no_cds, torch.ones_like(frame_weights), frame_weights)
+
+        # Entropy weighting
+        if self.config.use_entropy_weighting:
+            entropy_w = self._compute_entropy_weights(original_ids, original_ids)
+            if has_cds is not None:
+                entropy_w = torch.where(no_cds, torch.ones_like(entropy_w), entropy_w)
+            frame_weights = frame_weights * entropy_w
+
+        loss_per_pos = F.binary_cross_entropy_with_logits(
+            rtd_logits, rtd_labels, reduction='none'
+        )
+        return (loss_per_pos * frame_weights).mean()
 
     def forward(
         self,
@@ -853,7 +1222,17 @@ class RosettaTransformer(nn.Module):
         Returns:
             Dict with 'logits', 'frame_logits', and optionally 'loss'
         """
-        # Encode
+        # ELECTRA branch: generator + replaced-token detection
+        if self.config.use_electra and (self.training or labels is None):
+            return self._forward_electra(
+                original_ids=input_ids,
+                attention_mask=attention_mask,
+                frame_labels=frame_labels,
+                conservation_targets=conservation_targets,
+                global_step=global_step,
+            )
+
+        # Standard MLM branch
         hidden = self.encode(input_ids, attention_mask)
 
         # MLM prediction
@@ -933,6 +1312,15 @@ class RosettaTransformer(nn.Module):
                 output['conservation_loss'] = conservation_loss
                 if 'loss' in output:
                     output['loss'] = output['loss'] + self.config.conservation_weight * conservation_loss
+
+            # Embedding uniformity loss (anti-collapse, works for MLM too)
+            if self.config.contrastive_weight > 0 and 'loss' in output:
+                batch_size = logits_f32.shape[0]
+                if batch_size > 1:
+                    embs = F.normalize(hidden.float().mean(dim=1), dim=1)
+                    sim = embs @ embs.T
+                    off_diag = sim[~torch.eye(batch_size, dtype=torch.bool, device=sim.device)]
+                    output['loss'] = output['loss'] + self.config.contrastive_weight * off_diag.mean()
 
         return output
 
@@ -1249,6 +1637,18 @@ class RosettaTransformer(nn.Module):
         if hasattr(self, 'conservation_head'):
             counts['conservation_head'] = sum(
                 p.numel() for p in self.conservation_head.parameters()
+            )
+        if hasattr(self, 'jepa_head'):
+            counts['jepa_head'] = sum(
+                p.numel() for p in self.jepa_head.parameters()
+            )
+        if hasattr(self, 'generator'):
+            counts['electra_generator'] = sum(
+                p.numel() for p in self.generator.parameters()
+            )
+        if hasattr(self, 'rtd_head'):
+            counts['rtd_head'] = sum(
+                p.numel() for p in self.rtd_head.parameters()
             )
         counts['total'] = sum(p.numel() for p in self.parameters())
         return counts

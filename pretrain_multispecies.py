@@ -203,7 +203,7 @@ def build_blended_sampler(
     return WeightedRandomSampler(weights, num_samples=num_samples, replacement=True)
 
 
-def load_species_datasets(genome_files, seq_length, stride, tokenizer):
+def load_species_datasets(genome_files, seq_length, stride, tokenizer, use_electra=False):
     """Load FASTADatasets per species. Returns {genome_id: dataset}."""
     species_datasets = {}
     for gid, (fasta_path, gff_path) in genome_files.items():
@@ -215,6 +215,7 @@ def load_species_datasets(genome_files, seq_length, stride, tokenizer):
                 stride=stride,
                 tokenizer=tokenizer,
                 gff_path=gff_path,
+                use_electra=use_electra,
             )
             print(f"    -> {len(ds)} windows")
             species_datasets[gid] = ds
@@ -240,6 +241,8 @@ def main():
                         help="Gradient accumulation steps")
     parser.add_argument("--amp", action="store_true",
                         help="Enable automatic mixed precision (FP16)")
+    parser.add_argument("--electra", action="store_true",
+                        help="Use ELECTRA (replaced-token detection) instead of MLM")
     parser.add_argument("--workers", type=int, default=0,
                         help="DataLoader worker processes (0 on Windows)")
 
@@ -316,7 +319,7 @@ def main():
         print(f"  Frame labels for seqs > 10M bp use sparse storage to save RAM.")
 
     tokenizer = DNATokenizer(max_length=args.seq_length)
-    species_datasets = load_species_datasets(genome_files, args.seq_length, stride, tokenizer)
+    species_datasets = load_species_datasets(genome_files, args.seq_length, stride, tokenizer, args.electra)
 
     # Split into curriculum groups
     prokaryote_datasets = {k: v for k, v in species_datasets.items()
@@ -348,6 +351,7 @@ def main():
         use_amp=args.amp,
         num_workers=args.workers,
         warmup_plain_ce_steps=args.warmup_ce_steps,
+        use_electra=args.electra,
     )
 
     model = RosettaTransformer(config)
@@ -430,7 +434,7 @@ def main():
                 # Rebuild datasets at new window size
                 new_stride = current_seq_length
                 species_datasets = load_species_datasets(
-                    genome_files, current_seq_length, new_stride, tokenizer
+                    genome_files, current_seq_length, new_stride, tokenizer, args.electra
                 )
                 species_groups = [GENOMES[gid]['group'] for gid in species_datasets]
                 all_train_parts, all_train, all_val = split_and_combine(species_datasets)

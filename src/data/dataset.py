@@ -43,10 +43,12 @@ class GenomicDataset(Dataset):
         seq_length: int = 1024,
         coding_fraction: float = 0.3,
         tokenizer: Optional[DNATokenizer] = None,
+        use_electra: bool = False,
     ):
         self.num_samples = num_samples
         self.seq_length = seq_length
         self.coding_fraction = coding_fraction
+        self.use_electra = use_electra
         self.tokenizer = tokenizer or DNATokenizer(max_length=seq_length)
 
     def __len__(self) -> int:
@@ -57,7 +59,6 @@ class GenomicDataset(Dataset):
         seq, coding_regions = self._generate_realistic_sequence()
 
         input_ids = self.tokenizer.encode(seq)
-        masked_ids, labels = self.tokenizer.mask_tokens(input_ids)
         frame_labels = self._generate_frame_labels(len(seq), coding_regions)
 
         # Conservation proxy: 1.0 in coding, 0.4 in non-coding
@@ -65,6 +66,17 @@ class GenomicDataset(Dataset):
         for start, end, _ in coding_regions:
             conservation[start:min(end, len(seq))] = 1.0
 
+        if self.use_electra:
+            # ELECTRA: model handles masking internally
+            return {
+                'input_ids': input_ids,
+                'labels': torch.full_like(input_ids, -100),
+                'original_ids': input_ids,
+                'frame_labels': frame_labels,
+                'conservation_targets': conservation,
+            }
+
+        masked_ids, labels = self.tokenizer.mask_tokens(input_ids)
         return {
             'input_ids': masked_ids,
             'labels': labels,
@@ -164,9 +176,11 @@ class FASTADataset(Dataset):
         stride: int = 512,
         tokenizer: Optional[DNATokenizer] = None,
         gff_path: Optional[str] = None,
+        use_electra: bool = False,
     ):
         self.seq_length = seq_length
         self.stride = stride
+        self.use_electra = use_electra
         self.tokenizer = tokenizer or DNATokenizer(max_length=seq_length)
 
         # Load FASTA file
@@ -366,7 +380,6 @@ class FASTADataset(Dataset):
         seq_window = self.sequences[seq_idx][start:start + self.seq_length]
 
         input_ids = self.tokenizer.encode(seq_window)
-        masked_ids, labels = self.tokenizer.mask_tokens(input_ids)
 
         # Frame labels (zeros if no annotations available)
         frame_labels = self._get_frame_labels(seq_idx, start)
@@ -376,6 +389,16 @@ class FASTADataset(Dataset):
         # Conservation target from local entropy
         conservation_targets = self._compute_conservation_target(seq_window)
 
+        if self.use_electra:
+            return {
+                'input_ids': input_ids,
+                'labels': torch.full_like(input_ids, -100),
+                'original_ids': input_ids,
+                'frame_labels': frame_labels,
+                'conservation_targets': conservation_targets,
+            }
+
+        masked_ids, labels = self.tokenizer.mask_tokens(input_ids)
         return {
             'input_ids': masked_ids,
             'labels': labels,
